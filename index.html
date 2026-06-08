@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>VIEJO Detector</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="hero" aria-labelledby="app-title">
+        <div class="brand-row">
+          <span class="pulse-dot" aria-hidden="true"></span>
+          <span class="brand">VIEJO Listener</span>
+        </div>
+
+        <div class="hero-grid">
+          <div class="intro">
+            <p class="kicker">Wake word local</p>
+            <h1 id="app-title">Decí VIEJO y te contesto al toque.</h1>
+            <p class="lede">
+              La app escucha desde el navegador, detecta la palabra clave y responde con una palabra aleatoria usando voz del sistema.
+            </p>
+
+            <div class="actions" aria-label="Controles principales">
+              <button class="primary-button" id="toggle-listening" type="button">
+                <span class="button-icon" aria-hidden="true">●</span>
+                <span>Activar micrófono</span>
+              </button>
+              <button class="ghost-button" id="test-voice" type="button">
+                <span class="button-icon" aria-hidden="true">◉</span>
+                <span>Probar voz</span>
+              </button>
+            </div>
+          </div>
+
+          <aside class="status-panel" aria-label="Estado de la escucha">
+            <div class="meter" id="meter" aria-hidden="true">
+              <span></span>
+              <span></span>
+              <span></span>
+              <span></span>
+              <span></span>
+            </div>
+
+            <div class="status-copy">
+              <span class="status-label">Estado</span>
+              <strong id="status-text">Esperando permiso</strong>
+              <p id="support-text">Recomendado: Chrome o Edge en localhost.</p>
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <section class="workspace" aria-label="Panel de control">
+        <div class="control-strip">
+          <label class="field">
+            <span>Palabra clave</span>
+            <input id="keyword-input" type="text" value="viejo" autocomplete="off" />
+          </label>
+
+          <label class="field">
+            <span>Idioma</span>
+            <select id="language-select">
+              <option value="es-PY">Español Paraguay</option>
+              <option value="es-ES">Español España</option>
+              <option value="es-AR">Español Argentina</option>
+              <option value="es-MX">Español México</option>
+              <option value="en-US">English US</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Voz</span>
+            <select id="voice-select">
+              <option value="">Voz automática</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="dashboard">
+          <article class="readout-card response-card">
+            <span class="eyebrow">Respuesta</span>
+            <strong id="last-word">...</strong>
+            <p id="last-heard">Todavía no escuché la palabra clave.</p>
+          </article>
+
+          <article class="readout-card">
+            <span class="eyebrow">Transcripción</span>
+            <p class="transcript" id="transcript">La frase detectada va a aparecer acá.</p>
+          </article>
+
+          <article class="readout-card">
+            <span class="eyebrow">Historial</span>
+            <ol class="history-list" id="history-list" aria-live="polite"></ol>
+          </article>
+        </div>
+
+        <section class="word-bank" aria-labelledby="word-bank-title">
+          <div>
+            <span class="eyebrow">Banco random</span>
+            <h2 id="word-bank-title">Palabras que puede responder</h2>
+          </div>
+          <textarea id="word-bank" spellcheck="false">relámpago
+mate
+brisa
+asado
+foco
+trueno
+pomelo
+cancha
+misterio
+satélite
+domingo
+tereré</textarea>
+        </section>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,12 @@
+{
+  "name": "viejo",
+  "version": "1.0.0",
+  "description": "App web local que escucha el micrófono y responde con voz una palabra aleatoria cada vez que detecta la palabra clave `viejo`.",
+  "main": "app.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}

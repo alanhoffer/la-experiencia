@@ -1,0 +1,18 @@
+{
+  "triggers": [
+    {
+      "keyword": "viejo",
+      "responses": [
+        "viejo peruano",
+        "viejo toca nenes",
+        "mamani"
+      ]
+    },
+    {
+      "keyword": "mamani",
+      "responses": [
+        "mamani"
+      ]
+    }
+  ]
+}

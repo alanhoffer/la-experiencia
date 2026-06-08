@@ -1,0 +1,9 @@
+node_modules/
+.env
+npm-debug.log*
+data/debug.log
+data/tts/
+data/tts-cache/
+data/voice/
+models/*.zip
+models/vosk-model-*/
