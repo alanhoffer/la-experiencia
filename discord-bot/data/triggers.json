@@ -13,6 +13,51 @@
       "responses": [
         "mamani"
       ]
+    },
+    {
+      "keyword": "peti",
+      "responses": [
+        "canuto",
+        "dopado",
+        "dominado"
+      ]
+    },
+    {
+      "keyword": "maconha",
+      "responses": [
+        "maconha"
+      ]
+    },
+    {
+      "keyword": "mateo",
+      "responses": [
+        "gay"
+      ]
+    },
+    {
+      "keyword": "pechi",
+      "responses": [
+        "gay"
+      ]
+    },
+    {
+      "keyword": "mati",
+      "responses": [
+        "conocedor"
+      ]
+    },
+    {
+      "keyword": "a donde corremos",
+      "responses": [
+        "corremos a",
+        "corremos b"
+      ]
+    },
+    {
+      "keyword": "hola",
+      "responses": [
+        "dispuesto a estar"
+      ]
     }
   ]
 }

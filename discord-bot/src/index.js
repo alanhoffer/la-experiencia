@@ -52,6 +52,9 @@ const defaultTriggers = [
 
 const token = process.env.DISCORD_TOKEN;
 const commandPrefix = process.env.COMMAND_PREFIX || "!bot";
+const clearMessagesCommand = process.env.CLEAR_MESSAGES_COMMAND || "!clear";
+const initialAutoJoinMode = normalizeAutoJoinMode(process.env.AUTO_JOIN_VOICE || "off");
+let autoJoinMode = initialAutoJoinMode === "status" ? "off" : initialAutoJoinMode;
 const cooldownMs = Number.parseInt(process.env.COOLDOWN_MS || "1500", 10);
 const useTts = process.env.DISCORD_TTS === "true";
 const requireManageGuild = process.env.REQUIRE_MANAGE_GUILD_FOR_CONFIG !== "false";
@@ -68,19 +71,40 @@ const codexReasoningEffort = process.env.CODEX_REASONING_EFFORT || "low";
 const codexTimeoutMs = Number.parseInt(process.env.CODEX_TIMEOUT_MS || "90000", 10);
 const codexMaxWords = Number.parseInt(process.env.CODEX_MAX_WORDS || "45", 10);
 const codexWakeCooldownMs = Number.parseInt(process.env.CODEX_WAKE_COOLDOWN_MS || "8000", 10);
+const codexHoldMusicEnabled = process.env.CODEX_HOLD_MUSIC !== "false";
+const codexHoldMusicVolume = Number.parseFloat(process.env.CODEX_HOLD_MUSIC_VOLUME || "0.18");
+const clearScanLimit = Number.parseInt(process.env.CLEAR_SCAN_LIMIT || "1000", 10);
+const clearMaxScanLimit = Number.parseInt(process.env.CLEAR_MAX_SCAN_LIMIT || "2000", 10);
+const bulkDeleteMaxAgeMs = 14 * 24 * 60 * 60 * 1000;
+const autoJoinMinMembers = Number.parseInt(process.env.AUTO_JOIN_MIN_MEMBERS || "1", 10);
+const autoJoinCooldownMs = Number.parseInt(process.env.AUTO_JOIN_COOLDOWN_MS || "5000", 10);
+const autoJoinLeaveWhenEmpty = process.env.AUTO_JOIN_LEAVE_WHEN_EMPTY !== "false";
+const rejoinOnDisconnect = process.env.REJOIN_ON_DISCONNECT !== "false";
+const rejoinDelayMs = Number.parseInt(process.env.REJOIN_DELAY_MS || "1500", 10);
+const rejoinMaxAttempts = Number.parseInt(process.env.REJOIN_MAX_ATTEMPTS || "5", 10);
+const builtInVoiceKeywordAliases = new Map([
+  ["peti", ["piti", "pete", "pedi", "pity", "petit"]],
+]);
+const voiceKeywordAliases = parseVoiceKeywordAliases(process.env.VOICE_KEYWORD_ALIASES || "");
 const lastResponseByChannel = new Map();
 const lastVoiceTriggerByGuild = new Map();
 const lastCodexWakeByGuild = new Map();
+const lastAutoJoinByGuild = new Map();
+const lastVoiceChannelByGuild = new Map();
+const rejoinAttemptsByGuild = new Map();
+const rejoinTimersByGuild = new Map();
 const activeSpeechGuilds = new Set();
 const activeCodexGuilds = new Set();
 const speechQueues = new Map();
 const audioPlayers = new Map();
 const activeReceivers = new Set();
+const intentionalVoiceDisconnects = new Set();
 const voskRequests = new Map();
 const botRootPath = fileURLToPath(new URL("..", import.meta.url));
 const dataFilePath = fileURLToPath(new URL("../data/triggers.json", import.meta.url));
 const debugLogPath = fileURLToPath(new URL("../data/debug.log", import.meta.url));
 const codexDirPath = fileURLToPath(new URL("../data/codex", import.meta.url));
+const holdMusicPath = fileURLToPath(new URL("../data/hold-music/elevator-loop.wav", import.meta.url));
 const ttsDirPath = fileURLToPath(new URL("../data/tts", import.meta.url));
 const ttsCacheDirPath = fileURLToPath(new URL("../data/tts-cache", import.meta.url));
 const voiceDirPath = fileURLToPath(new URL("../data/voice", import.meta.url));
@@ -115,7 +139,13 @@ client.once(Events.ClientReady, () => {
   if (codexEnabled) {
     console.log(`Wake Codex: ${codexWakeWord} -> ${codexModel}`);
   }
+  console.log(`Autojoin: ${autoJoinMode}; rejoin: ${rejoinOnDisconnect ? "on" : "off"}`);
+  const voiceAliasSummary = formatVoiceKeywordAliases();
+  if (voiceAliasSummary) {
+    console.log(`Aliases de voz: ${voiceAliasSummary}`);
+  }
   getVoskWorker();
+  ensureCodexHoldMusic().catch((error) => console.error("No pude preparar musica de espera:", error));
   prewarmSpeechCache().catch((error) => console.error("No pude precachear audios:", error));
 });
 
@@ -125,6 +155,12 @@ client.on(Events.MessageCreate, async (message) => {
   await debugLog(
     `message guild=${message.guild.name} channel=${message.channelId} author=${message.author.tag} length=${message.content.length}`,
   );
+
+  if (isClearMessagesCommand(message.content)) {
+    await debugLog("clear messages command matched");
+    await handleClearMessagesCommand(message);
+    return;
+  }
 
   if (isCommand(message.content)) {
     await debugLog("command matched");
@@ -158,6 +194,16 @@ client.on(Events.MessageCreate, async (message) => {
   }
 });
 
+client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
+  try {
+    await handleSelfVoiceReconnect(oldState, newState);
+    await handleVoiceStateAutoJoin(oldState, newState);
+  } catch (error) {
+    console.error("No pude procesar estado de voz:", error);
+    debugLog(`voice state failed: ${error.message}`).catch(() => {});
+  }
+});
+
 client.on("error", (error) => {
   console.error("Error del cliente Discord:", error);
 });
@@ -181,6 +227,17 @@ async function handleCommand(message) {
     case "join":
     case "entrar":
       await joinUserVoiceChannel(message);
+      break;
+
+    case "joinmost":
+    case "mas":
+    case "popular":
+      await joinMostPopulatedVoiceChannel(message);
+      break;
+
+    case "autojoin":
+    case "autoentrar":
+      await configureAutoJoin(message, payload);
       break;
 
     case "leave":
@@ -229,39 +286,47 @@ async function joinUserVoiceChannel(message) {
     return;
   }
 
-  const permissions = voiceChannel.permissionsFor(message.client.user);
-  if (!permissions?.has(PermissionFlagsBits.Connect)) {
-    await sendReply(message, {
-      content: "No tengo permiso para conectarme a ese canal de voz.",
-      allowedMentions: { repliedUser: false },
-    });
-    return;
-  }
-
-  const connection = joinVoiceChannel({
-    channelId: voiceChannel.id,
-    guildId: voiceChannel.guild.id,
-    adapterCreator: voiceChannel.guild.voiceAdapterCreator,
-    selfDeaf: false,
-    selfMute: false,
-  });
-
-  try {
-    await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
-    setupVoiceReceiver(connection, message.guild.id);
+  const result = await joinGuildVoiceChannel(voiceChannel);
+  if (result.ok) {
     await queueSpeech(message.guild.id, "listo");
     await sendReply(message, {
       content: `Listo, me uni a ${voiceChannel.name}.`,
       allowedMentions: { repliedUser: false },
     });
-  } catch (error) {
-    connection.destroy();
-    console.error("No pude entrar al canal de voz:", error);
+    return;
+  }
+
+  await sendReply(message, {
+    content: result.message,
+    allowedMentions: { repliedUser: false },
+  });
+}
+
+async function joinMostPopulatedVoiceChannel(message) {
+  const voiceChannel = findMostPopulatedVoiceChannel(message.guild);
+
+  if (!voiceChannel) {
     await sendReply(message, {
-      content: "No pude conectarme al canal de voz. Revisa permisos o intenta otra vez.",
+      content: "No encontre un canal de voz con gente y permisos para entrar.",
       allowedMentions: { repliedUser: false },
     });
+    return;
   }
+
+  const result = await joinGuildVoiceChannel(voiceChannel);
+  if (result.ok) {
+    await queueSpeech(message.guild.id, "listo");
+    await sendReply(message, {
+      content: `Listo, entre al canal con mas gente: ${voiceChannel.name}.`,
+      allowedMentions: { repliedUser: false },
+    });
+    return;
+  }
+
+  await sendReply(message, {
+    content: result.message,
+    allowedMentions: { repliedUser: false },
+  });
 }
 
 async function leaveVoiceChannel(message) {
@@ -275,11 +340,291 @@ async function leaveVoiceChannel(message) {
     return;
   }
 
-  connection.destroy();
+  markIntentionalVoiceDisconnect(message.guild.id);
+  destroyVoiceConnection(connection, message.guild.id);
   await sendReply(message, {
     content: "Sali del canal de voz.",
     allowedMentions: { repliedUser: false },
   });
+}
+
+async function configureAutoJoin(message, payload) {
+  if (!(await canEditConfig(message))) return;
+
+  const requestedMode = normalizeAutoJoinMode(payload || "status");
+
+  if (requestedMode === "status") {
+    await sendReply(message, {
+      content: `Autojoin actual: ${describeAutoJoinMode(autoJoinMode)}.`,
+      allowedMentions: { repliedUser: false },
+    });
+    return;
+  }
+
+  autoJoinMode = requestedMode;
+
+  if (autoJoinMode === "most") {
+    const voiceChannel = findMostPopulatedVoiceChannel(message.guild);
+    if (voiceChannel) {
+      const result = await joinGuildVoiceChannel(voiceChannel);
+      await sendReply(message, {
+        content: result.ok
+          ? `Autojoin activado: voy a seguir el canal con mas gente. Ahora entre a ${voiceChannel.name}.`
+          : `Autojoin activado, pero no pude entrar ahora: ${result.message}`,
+        allowedMentions: { repliedUser: false },
+      });
+      return;
+    }
+  }
+
+  if (autoJoinMode === "first" && message.member?.voice?.channel) {
+    await joinGuildVoiceChannel(message.member.voice.channel);
+  }
+
+  await sendReply(message, {
+    content: `Autojoin: ${describeAutoJoinMode(autoJoinMode)}.`,
+    allowedMentions: { repliedUser: false },
+  });
+}
+
+async function joinGuildVoiceChannel(voiceChannel) {
+  const permissions = voiceChannel.permissionsFor(client.user);
+  if (
+    !permissions?.has(PermissionFlagsBits.Connect) ||
+    !permissions?.has(PermissionFlagsBits.Speak)
+  ) {
+    return { ok: false, message: "No tengo permiso para conectarme y hablar en ese canal de voz." };
+  }
+
+  const connection = joinVoiceChannel({
+    channelId: voiceChannel.id,
+    guildId: voiceChannel.guild.id,
+    adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+    selfDeaf: false,
+    selfMute: false,
+  });
+
+  try {
+    await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+    setupVoiceReceiver(connection, voiceChannel.guild.id);
+    lastVoiceChannelByGuild.set(voiceChannel.guild.id, voiceChannel.id);
+    rejoinAttemptsByGuild.delete(voiceChannel.guild.id);
+    clearVoiceRejoinTimer(voiceChannel.guild.id);
+    intentionalVoiceDisconnects.delete(voiceChannel.guild.id);
+    return { ok: true, connection };
+  } catch (error) {
+    destroyVoiceConnection(connection, voiceChannel.guild.id);
+    console.error("No pude entrar al canal de voz:", error);
+    return {
+      ok: false,
+      message: "No pude conectarme al canal de voz. Revisa permisos o intenta otra vez.",
+    };
+  }
+}
+
+async function handleVoiceStateAutoJoin(oldState, newState) {
+  if (autoJoinMode === "off") return;
+
+  const member = newState.member || oldState.member;
+  if (!member || member.user.bot) return;
+
+  const guild = newState.guild || oldState.guild;
+  if (!guild || isAutoJoinOnCooldown(guild.id)) return;
+
+  if (autoJoinMode === "first") {
+    if (!newState.channel || oldState.channelId === newState.channelId) return;
+    if (getVoiceConnection(guild.id)) return;
+
+    markAutoJoinAttempt(guild.id);
+    await debugLog(`autojoin first channel=${newState.channel.name}`);
+    await joinGuildVoiceChannel(newState.channel);
+    return;
+  }
+
+  if (autoJoinMode === "most") {
+    const targetChannel = findMostPopulatedVoiceChannel(guild);
+    const connection = getVoiceConnection(guild.id);
+
+    if (!targetChannel) {
+      if (autoJoinLeaveWhenEmpty && connection) {
+        markIntentionalVoiceDisconnect(guild.id);
+        destroyVoiceConnection(connection, guild.id);
+        await debugLog("autojoin most left empty guild");
+      }
+      return;
+    }
+
+    if (connection?.joinConfig?.channelId === targetChannel.id) return;
+
+    markAutoJoinAttempt(guild.id);
+    await debugLog(`autojoin most channel=${targetChannel.name}`);
+    await joinGuildVoiceChannel(targetChannel);
+  }
+}
+
+async function handleSelfVoiceReconnect(oldState, newState) {
+  if (!rejoinOnDisconnect) return;
+
+  const botId = client.user?.id;
+  const stateUserId = newState.id || newState.member?.id || oldState.id || oldState.member?.id;
+  if (!botId || stateUserId !== botId) return;
+
+  const guild = newState.guild || oldState.guild;
+  if (!guild) return;
+
+  if (newState.channelId) {
+    lastVoiceChannelByGuild.set(guild.id, newState.channelId);
+    rejoinAttemptsByGuild.delete(guild.id);
+    clearVoiceRejoinTimer(guild.id);
+    await debugLog(`self voice channel guild=${guild.id} channel=${newState.channelId}`);
+    return;
+  }
+
+  const oldChannelId = oldState.channelId || lastVoiceChannelByGuild.get(guild.id);
+  if (!oldChannelId) return;
+
+  if (intentionalVoiceDisconnects.delete(guild.id)) {
+    await debugLog(`rejoin skipped intentional guild=${guild.id}`);
+    return;
+  }
+
+  const attempt = (rejoinAttemptsByGuild.get(guild.id) || 0) + 1;
+  if (attempt > rejoinMaxAttempts) {
+    await debugLog(`rejoin skipped max attempts guild=${guild.id} channel=${oldChannelId}`);
+    return;
+  }
+
+  rejoinAttemptsByGuild.set(guild.id, attempt);
+  activeReceivers.delete(guild.id);
+  scheduleVoiceRejoin(guild, oldChannelId, attempt);
+}
+
+async function rejoinVoiceChannelById(guild, channelId, attempt) {
+  rejoinTimersByGuild.delete(guild.id);
+
+  const existingConnection = getVoiceConnection(guild.id);
+  if (existingConnection) {
+    const status = existingConnection.state?.status || "unknown";
+    const currentChannelId = existingConnection.joinConfig?.channelId || "unknown";
+
+    if (status === VoiceConnectionStatus.Ready && currentChannelId === channelId) {
+      await debugLog(`rejoin skipped already ready guild=${guild.id} channel=${channelId}`);
+      rejoinAttemptsByGuild.delete(guild.id);
+      return;
+    }
+
+    await debugLog(
+      `rejoin destroying stale connection guild=${guild.id} status=${status} channel=${currentChannelId}`,
+    );
+    destroyVoiceConnection(existingConnection, guild.id);
+  }
+
+  const voiceChannel =
+    guild.channels.cache.get(channelId) ||
+    (await guild.channels.fetch(channelId).catch(() => null));
+
+  if (!voiceChannel || !isJoinableVoiceChannel(voiceChannel)) {
+    await debugLog(`rejoin target unavailable guild=${guild.id} channel=${channelId}`);
+    scheduleNextVoiceRejoin(guild, channelId, attempt);
+    return;
+  }
+
+  await debugLog(`rejoin attempt guild=${guild.id} channel=${voiceChannel.name} attempt=${attempt}`);
+  const result = await joinGuildVoiceChannel(voiceChannel);
+  if (!result.ok) {
+    await debugLog(`rejoin attempt failed guild=${guild.id} message=${result.message}`);
+    scheduleNextVoiceRejoin(guild, channelId, attempt);
+  }
+}
+
+function scheduleVoiceRejoin(guild, channelId, attempt) {
+  if (attempt > rejoinMaxAttempts) {
+    debugLog(`rejoin skipped max attempts guild=${guild.id} channel=${channelId}`).catch(() => {});
+    return;
+  }
+
+  const existingTimer = rejoinTimersByGuild.get(guild.id);
+  if (existingTimer) {
+    clearTimeout(existingTimer);
+  }
+
+  debugLog(`rejoin scheduled guild=${guild.id} channel=${channelId} attempt=${attempt}`).catch(() => {});
+  const timer = setTimeout(() => {
+    rejoinVoiceChannelById(guild, channelId, attempt).catch((error) => {
+      console.error("No pude reconectar al canal de voz:", error);
+      debugLog(`rejoin failed: ${error.message}`).catch(() => {});
+      scheduleNextVoiceRejoin(guild, channelId, attempt);
+    });
+  }, rejoinDelayMs);
+
+  rejoinTimersByGuild.set(guild.id, timer);
+}
+
+function scheduleNextVoiceRejoin(guild, channelId, attempt) {
+  const nextAttempt = attempt + 1;
+  rejoinAttemptsByGuild.set(guild.id, nextAttempt);
+  scheduleVoiceRejoin(guild, channelId, nextAttempt);
+}
+
+function findMostPopulatedVoiceChannel(guild) {
+  return [...guild.channels.cache.values()]
+    .filter(isJoinableVoiceChannel)
+    .map((channel) => ({
+      channel,
+      humanMembers: channel.members.filter((member) => !member.user.bot).size,
+    }))
+    .filter((candidate) => candidate.humanMembers >= autoJoinMinMembers)
+    .sort((left, right) => {
+      if (right.humanMembers !== left.humanMembers) {
+        return right.humanMembers - left.humanMembers;
+      }
+
+      return left.channel.position - right.channel.position;
+    })[0]?.channel || null;
+}
+
+function isJoinableVoiceChannel(channel) {
+  if (typeof channel.isVoiceBased !== "function" || !channel.isVoiceBased()) return false;
+
+  const permissions = channel.permissionsFor(client.user);
+  return Boolean(
+    permissions?.has(PermissionFlagsBits.ViewChannel) &&
+      permissions?.has(PermissionFlagsBits.Connect) &&
+      permissions?.has(PermissionFlagsBits.Speak),
+  );
+}
+
+function isAutoJoinOnCooldown(guildId) {
+  const lastAttemptAt = lastAutoJoinByGuild.get(guildId) || 0;
+  return Date.now() - lastAttemptAt < autoJoinCooldownMs;
+}
+
+function markAutoJoinAttempt(guildId) {
+  lastAutoJoinByGuild.set(guildId, Date.now());
+}
+
+function markIntentionalVoiceDisconnect(guildId) {
+  intentionalVoiceDisconnects.add(guildId);
+  clearVoiceRejoinTimer(guildId);
+  rejoinAttemptsByGuild.delete(guildId);
+}
+
+function destroyVoiceConnection(connection, guildId) {
+  try {
+    connection.destroy();
+  } catch (error) {
+    debugLog(`voice destroy ignored: ${error.message}`).catch(() => {});
+  }
+
+  activeReceivers.delete(guildId);
+}
+
+function clearVoiceRejoinTimer(guildId) {
+  const timer = rejoinTimersByGuild.get(guildId);
+  if (!timer) return;
+
+  clearTimeout(timer);
+  rejoinTimersByGuild.delete(guildId);
 }
 
 async function addTriggers(message, payload) {
@@ -393,16 +738,47 @@ async function clearTriggers(message) {
   });
 }
 
+async function handleClearMessagesCommand(message) {
+  if (!(await canClearMessages(message))) return;
+
+  const scanLimit = parseClearMessagesLimit(message.content);
+  await debugLog(`clear messages scan limit=${scanLimit}`);
+
+  const scannedMessages = await fetchMessagesForClear(message.channel, scanLimit);
+  const messagesToDelete = scannedMessages.filter(isBotUsageMessage);
+  const result = await deleteMessagesForClear(messagesToDelete);
+
+  await debugLog(
+    `clear messages scanned=${scannedMessages.length} matched=${messagesToDelete.length} deleted=${result.deleted} skippedOld=${result.skippedOld} failed=${result.failed}`,
+  );
+
+  const parts = [`Limpieza lista: borre ${result.deleted} mensajes.`];
+  if (result.skippedOld) {
+    parts.push(`No toque ${result.skippedOld} mensajes de mas de 14 dias.`);
+  }
+  if (result.failed) {
+    parts.push(`Fallaron ${result.failed}.`);
+  }
+
+  const notice = await message.channel.send(parts.join(" "));
+  setTimeout(() => {
+    notice.delete().catch(() => {});
+  }, 5000);
+}
+
 async function sendHelp(message) {
   await sendReply(message, {
     content: [
       `Comandos:`,
       `\`${commandPrefix} join\` - me uno a tu canal de voz.`,
+      `\`${commandPrefix} joinmost\` - entro al canal de voz con mas personas.`,
+      `\`${commandPrefix} autojoin on|most|off\` - activo o apago entrada automatica a canales de voz.`,
       `\`${commandPrefix} leave\` - salgo del canal de voz.`,
       `\`${commandPrefix} add viejo, bro => mate | trueno\` - agrega keywords y respuestas.`,
       `\`${commandPrefix} remove viejo\` - elimina una keyword completa.`,
       `\`${commandPrefix} remove viejo => mate\` - elimina solo una respuesta.`,
       `\`${commandPrefix} list\` - muestra lo registrado.`,
+      `\`${clearMessagesCommand}\` - borra mensajes escritos del bot y de quienes usaron el bot en este canal.`,
     ].join("\n"),
     allowedMentions: { repliedUser: false },
   });
@@ -417,6 +793,29 @@ async function canEditConfig(message) {
     allowedMentions: { repliedUser: false },
   });
   return false;
+}
+
+async function canClearMessages(message) {
+  if (!message.member?.permissions?.has(PermissionFlagsBits.ManageMessages)) {
+    await sendReply(message, {
+      content: "Necesitas permiso Manage Messages para usar !clear.",
+      allowedMentions: { repliedUser: false },
+    });
+    return false;
+  }
+
+  const botMember = message.guild.members.me || (await message.guild.members.fetchMe());
+  const botPermissions = message.channel.permissionsFor(botMember);
+
+  if (!botPermissions?.has(PermissionFlagsBits.ManageMessages)) {
+    await sendReply(message, {
+      content: "Necesito permiso Manage Messages en este canal para borrar mensajes.",
+      allowedMentions: { repliedUser: false },
+    });
+    return false;
+  }
+
+  return true;
 }
 
 function normalizeText(value) {
@@ -436,11 +835,68 @@ function isCommand(content) {
   return lowerContent === normalizedPrefix || lowerContent.startsWith(`${normalizedPrefix} `);
 }
 
+function normalizeAutoJoinMode(value) {
+  const normalizedValue = normalizeText(value);
+
+  if (["on", "si", "yes", "true", "first", "primero", "persona"].includes(normalizedValue)) {
+    return "first";
+  }
+
+  if (["most", "mas", "popular", "mayoria", "lleno"].includes(normalizedValue)) {
+    return "most";
+  }
+
+  if (["off", "no", "false", "apagado", "desactivar", "disable"].includes(normalizedValue)) {
+    return "off";
+  }
+
+  return "status";
+}
+
+function describeAutoJoinMode(mode) {
+  if (mode === "first") return "activado, entro al canal cuando alguien entra y estoy desconectado";
+  if (mode === "most") return "activado, sigo el canal de voz con mas personas";
+  return "apagado";
+}
+
+function isClearMessagesCommand(content) {
+  const trimmed = content.trim().toLowerCase();
+  const normalizedCommand = clearMessagesCommand.toLowerCase();
+  return trimmed === normalizedCommand || trimmed.startsWith(`${normalizedCommand} `);
+}
+
+function parseClearMessagesLimit(content) {
+  const [, rawLimit] = content.trim().split(/\s+/);
+  const parsedLimit = Number.parseInt(rawLimit || "", 10);
+  const requestedLimit = Number.isFinite(parsedLimit) ? parsedLimit : clearScanLimit;
+  return Math.max(1, Math.min(requestedLimit, clearMaxScanLimit));
+}
+
+function isBotUsageMessage(candidate) {
+  if (candidate.author?.id === client.user.id) return true;
+  if (candidate.author?.bot) return false;
+
+  const content = candidate.content || "";
+  if (isClearMessagesCommand(content) || isCommand(content)) return true;
+  if (codexEnabled && containsKeyword(content, codexWakeWord)) return true;
+
+  return Boolean(findMatchingTrigger(content));
+}
+
 function findMatchingTrigger(content) {
   const normalizedContent = ` ${normalizeText(content)} `;
   return triggerStore.triggers.find((trigger) => {
     const normalizedKeyword = normalizeText(trigger.keyword);
     return normalizedKeyword && normalizedContent.includes(` ${normalizedKeyword} `);
+  });
+}
+
+function findMatchingVoiceTrigger(content) {
+  const normalizedContent = ` ${normalizeText(content)} `;
+
+  return triggerStore.triggers.find((trigger) => {
+    const candidates = getVoiceTriggerCandidates(trigger.keyword);
+    return candidates.some((candidate) => normalizedContent.includes(` ${candidate} `));
   });
 }
 
@@ -485,6 +941,22 @@ function parseList(value, separator = /,/) {
       .map((item) => item.trim())
       .filter(Boolean),
   );
+}
+
+function parseVoiceKeywordAliases(value) {
+  const aliases = new Map();
+
+  for (const group of value.split(";")) {
+    const [rawKeyword, rawAliases] = group.split(":");
+    const keyword = normalizeText(rawKeyword || "");
+    const parsedAliases = parseList(rawAliases || "");
+
+    if (keyword && parsedAliases.length) {
+      aliases.set(keyword, parsedAliases.map(normalizeText));
+    }
+  }
+
+  return aliases;
 }
 
 function getOrCreateTrigger(keyword) {
@@ -572,6 +1044,70 @@ function truncateDiscordMessage(content) {
   return `${content.slice(0, 1880)}\n...`;
 }
 
+async function fetchMessagesForClear(channel, limit) {
+  const fetchedMessages = [];
+  let before;
+
+  while (fetchedMessages.length < limit) {
+    const batch = await channel.messages.fetch({
+      limit: Math.min(100, limit - fetchedMessages.length),
+      before,
+    });
+
+    if (!batch.size) break;
+
+    const messages = [...batch.values()];
+    fetchedMessages.push(...messages);
+    before = messages[messages.length - 1]?.id;
+
+    if (!before) break;
+  }
+
+  return fetchedMessages;
+}
+
+async function deleteMessagesForClear(messages) {
+  let deleted = 0;
+  let skippedOld = 0;
+  let failed = 0;
+
+  for (const batch of chunkArray(messages, 100)) {
+    const freshMessages = batch.filter((candidate) => {
+      const isFresh = Date.now() - candidate.createdTimestamp < bulkDeleteMaxAgeMs;
+      if (!isFresh) skippedOld += 1;
+      return isFresh;
+    });
+
+    if (!freshMessages.length) continue;
+
+    try {
+      if (freshMessages.length === 1) {
+        await freshMessages[0].delete();
+        deleted += 1;
+      } else {
+        const deletedMessages = await freshMessages[0].channel.bulkDelete(freshMessages, true);
+        deleted += deletedMessages.size;
+        failed += freshMessages.length - deletedMessages.size;
+      }
+    } catch (error) {
+      failed += freshMessages.length;
+      await debugLog(`clear delete failed: ${error.message}`);
+    }
+  }
+
+  return { deleted, skippedOld, failed };
+}
+
+function chunkArray(values, size) {
+  const chunks = [];
+
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size));
+  }
+
+  return chunks;
+}
+
 function setupVoiceReceiver(connection, guildId) {
   if (activeReceivers.has(guildId)) return;
 
@@ -657,7 +1193,7 @@ async function handleSpokenSegment(connection, guildId, userId) {
       return;
     }
 
-    const trigger = findMatchingTrigger(transcript);
+    const trigger = findMatchingVoiceTrigger(transcript);
     if (!trigger) return;
     if (isVoiceTriggerOnCooldown(guildId, userId)) {
       await debugLog(`voice trigger ignored duplicate keyword=${trigger.keyword}`);
@@ -713,12 +1249,42 @@ async function transcribeWav(wavFile, options = {}) {
 }
 
 function getVoiceKeywords() {
-  const keywords = triggerStore.triggers.map((trigger) => trigger.keyword);
+  const keywords = triggerStore.triggers.flatMap((trigger) =>
+    getVoiceTriggerCandidates(trigger.keyword),
+  );
   if (codexEnabled && codexWakeWord) {
     keywords.push(codexWakeWord);
   }
 
   return uniqueValues(keywords);
+}
+
+function getVoiceTriggerCandidates(keyword) {
+  const normalizedKeyword = normalizeText(keyword);
+  const aliases = uniqueValues([
+    ...(builtInVoiceKeywordAliases.get(normalizedKeyword) || []),
+    ...(voiceKeywordAliases.get(normalizedKeyword) || []),
+  ]).map(normalizeText);
+
+  if (aliases.length) return aliases;
+  return normalizedKeyword ? [normalizedKeyword] : [];
+}
+
+function formatVoiceKeywordAliases() {
+  const aliasLines = [];
+  const keywords = uniqueValues([
+    ...builtInVoiceKeywordAliases.keys(),
+    ...voiceKeywordAliases.keys(),
+  ]);
+
+  for (const keyword of keywords) {
+    const aliases = getVoiceTriggerCandidates(keyword);
+    if (aliases.length) {
+      aliasLines.push(`${keyword} -> ${aliases.join(",")}`);
+    }
+  }
+
+  return aliasLines.join("; ");
 }
 
 function getVoskWorker() {
@@ -854,18 +1420,35 @@ async function handleCodexVoiceQuestion(guildId, userId, question) {
   markVoiceTrigger(guildId, userId);
   activeCodexGuilds.add(guildId);
 
+  let stopHoldMusic = null;
+
   try {
     await debugLog(`codex question=${question}`);
+    stopHoldMusic = await startCodexHoldMusic(guildId);
     const answer = await queryCodexCli(question);
     const spokenAnswer = sanitizeCodexAnswer(answer);
+
+    if (stopHoldMusic) {
+      await stopHoldMusic({ keepSpeechLock: true });
+      stopHoldMusic = null;
+    }
 
     await debugLog(`codex answer=${spokenAnswer}`);
     await queueSpeech(guildId, spokenAnswer || "Codex no devolvio una respuesta.");
   } catch (error) {
+    if (stopHoldMusic) {
+      await stopHoldMusic({ keepSpeechLock: true });
+      stopHoldMusic = null;
+    }
+
     console.error("No pude consultar Codex CLI:", error.message);
     await debugLog(`codex failed: ${error.message}`);
     await queueSpeech(guildId, "No pude consultar Codex ahora.");
   } finally {
+    if (stopHoldMusic) {
+      await stopHoldMusic();
+    }
+
     activeCodexGuilds.delete(guildId);
   }
 }
@@ -877,6 +1460,149 @@ function isCodexWakeOnCooldown(guildId) {
 
 function markCodexWake(guildId) {
   lastCodexWakeByGuild.set(guildId, Date.now());
+}
+
+async function startCodexHoldMusic(guildId) {
+  if (!codexHoldMusicEnabled) return null;
+
+  const connection = getVoiceConnection(guildId);
+  if (!connection) {
+    await debugLog("hold music skipped no connection");
+    return null;
+  }
+
+  await ensureCodexHoldMusic();
+
+  const player = getAudioPlayer(guildId);
+  connection.subscribe(player);
+  activeSpeechGuilds.add(guildId);
+
+  const ffmpeg = new prism.FFmpeg({
+    args: [
+      "-stream_loop",
+      "-1",
+      "-analyzeduration",
+      "0",
+      "-loglevel",
+      "0",
+      "-i",
+      holdMusicPath,
+      "-filter:a",
+      `volume=${codexHoldMusicVolume}`,
+      "-f",
+      "s16le",
+      "-ar",
+      "48000",
+      "-ac",
+      "2",
+    ],
+  });
+
+  const resource = createAudioResource(ffmpeg, {
+    inputType: StreamType.Raw,
+  });
+
+  let stopped = false;
+  player.play(resource);
+  await debugLog("hold music started");
+
+  return async ({ keepSpeechLock = false } = {}) => {
+    if (stopped) return;
+
+    stopped = true;
+    player.stop(true);
+    await entersState(player, AudioPlayerStatus.Idle, 1000).catch(() => {});
+    await debugLog("hold music stopped");
+
+    if (!keepSpeechLock) {
+      setTimeout(() => {
+        activeSpeechGuilds.delete(guildId);
+      }, 350);
+    }
+  };
+}
+
+async function ensureCodexHoldMusic() {
+  if (!codexHoldMusicEnabled || (await fileExists(holdMusicPath))) return;
+
+  await mkdir(dirname(holdMusicPath), { recursive: true });
+  await writeFile(holdMusicPath, buildElevatorMusicWav());
+  await debugLog("hold music generated");
+}
+
+function buildElevatorMusicWav() {
+  const sampleRate = 24000;
+  const durationSeconds = 12;
+  const totalSamples = sampleRate * durationSeconds;
+  const dataSize = totalSamples * 2;
+  const buffer = Buffer.alloc(44 + dataSize);
+
+  buffer.write("RIFF", 0);
+  buffer.writeUInt32LE(36 + dataSize, 4);
+  buffer.write("WAVE", 8);
+  buffer.write("fmt ", 12);
+  buffer.writeUInt32LE(16, 16);
+  buffer.writeUInt16LE(1, 20);
+  buffer.writeUInt16LE(1, 22);
+  buffer.writeUInt32LE(sampleRate, 24);
+  buffer.writeUInt32LE(sampleRate * 2, 28);
+  buffer.writeUInt16LE(2, 32);
+  buffer.writeUInt16LE(16, 34);
+  buffer.write("data", 36);
+  buffer.writeUInt32LE(dataSize, 40);
+
+  const bpm = 96;
+  const beatSeconds = 60 / bpm;
+  const chordSeconds = beatSeconds * 2;
+  const chords = [
+    [60, 64, 67, 71],
+    [57, 60, 64, 67],
+    [62, 65, 69, 72],
+    [55, 59, 62, 65],
+  ];
+  const melody = [76, 79, 83, 81, 79, 76, 74, 72, 74, 76, 79, 76, 72, 74, 71, 72];
+
+  for (let sampleIndex = 0; sampleIndex < totalSamples; sampleIndex += 1) {
+    const time = sampleIndex / sampleRate;
+    const chordIndex = Math.floor(time / chordSeconds) % chords.length;
+    const chord = chords[chordIndex];
+    const chordTime = time % chordSeconds;
+    const beatIndex = Math.floor(time / beatSeconds) % melody.length;
+    const beatTime = time % beatSeconds;
+
+    let sample = 0;
+
+    for (const note of chord) {
+      sample += Math.sin(2 * Math.PI * midiToFrequency(note) * time) * 0.035;
+      sample += Math.sin(2 * Math.PI * midiToFrequency(note + 12) * time) * 0.012;
+    }
+
+    const bassNote = chord[0] - 12;
+    sample += Math.sin(2 * Math.PI * midiToFrequency(bassNote) * time) * 0.08;
+
+    const melodyEnvelope = pluckEnvelope(beatTime, beatSeconds);
+    sample += Math.sin(2 * Math.PI * midiToFrequency(melody[beatIndex]) * time) * 0.16 * melodyEnvelope;
+
+    const chordEnvelope = 0.55 + 0.45 * Math.sin(Math.PI * chordTime / chordSeconds);
+    const tremolo = 0.82 + 0.18 * Math.sin(2 * Math.PI * 5.2 * time);
+    sample = Math.tanh(sample * chordEnvelope * tremolo * 1.8);
+
+    buffer.writeInt16LE(Math.round(sample * 32767), 44 + sampleIndex * 2);
+  }
+
+  return buffer;
+}
+
+function pluckEnvelope(time, duration) {
+  const attack = 0.035;
+  const release = 0.42;
+
+  if (time < attack) return time / attack;
+  return Math.max(0, 1 - (time - attack) / (duration * release));
+}
+
+function midiToFrequency(note) {
+  return 440 * 2 ** ((note - 69) / 12);
 }
 
 async function queryCodexCli(question) {
@@ -979,7 +1705,7 @@ function runCodexCommand(command, prompt, outputFile) {
 function buildCodexPrompt(question) {
   return [
     "Sos un asistente de voz dentro de un canal de Discord.",
-    `Responde en español claro. Maximo ${codexMaxWords} palabras.`,
+    `Responde en espanol claro. Maximo ${codexMaxWords} palabras.`,
     "No uses markdown, listas, tablas, emojis ni bloques de codigo.",
     "Si falta contexto, da la mejor respuesta breve y practica.",
     `Pregunta del usuario: ${question}`,
@@ -1036,11 +1762,12 @@ async function queueSpeech(guildId, text) {
 
 async function playSpeech(connection, guildId, text) {
   await debugLog(`speech play text=${text}`);
-  const audio = await synthesizeSpeech(text);
-
   activeSpeechGuilds.add(guildId);
+  let audio = null;
 
   try {
+    audio = await synthesizeSpeech(text);
+
     const player = getAudioPlayer(guildId);
     connection.subscribe(player);
 
@@ -1072,7 +1799,7 @@ async function playSpeech(connection, guildId, text) {
       activeSpeechGuilds.delete(guildId);
     }, 350);
 
-    if (audio.temporary) {
+    if (audio?.temporary) {
       await unlink(audio.path).catch(() => {});
     }
   }
