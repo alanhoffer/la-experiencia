@@ -5,11 +5,14 @@ import wave
 from vosk import KaldiRecognizer, Model, SetLogLevel
 
 
-def transcribe(model, audio_path, keywords):
+def transcribe(model, audio_path, keywords, use_grammar=True):
     with wave.open(audio_path, "rb") as wav_file:
         sample_rate = wav_file.getframerate()
-        grammar = json.dumps(sorted(set(keywords + ["[unk]"])), ensure_ascii=False)
-        recognizer = KaldiRecognizer(model, sample_rate, grammar)
+        if use_grammar:
+            grammar = json.dumps(sorted(set(keywords + ["[unk]"])), ensure_ascii=False)
+            recognizer = KaldiRecognizer(model, sample_rate, grammar)
+        else:
+            recognizer = KaldiRecognizer(model, sample_rate)
 
         while True:
             data = wav_file.readframes(4000)
@@ -35,7 +38,12 @@ def main():
 
         try:
             payload = json.loads(line)
-            text = transcribe(model, payload["audio"], payload.get("keywords", []))
+            text = transcribe(
+                model,
+                payload["audio"],
+                payload.get("keywords", []),
+                payload.get("grammar", True),
+            )
             response = {"id": payload.get("id"), "text": text}
         except Exception as error:
             response = {"id": payload.get("id") if "payload" in locals() else None, "error": str(error)}

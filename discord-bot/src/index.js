@@ -57,19 +57,30 @@ const useTts = process.env.DISCORD_TTS === "true";
 const requireManageGuild = process.env.REQUIRE_MANAGE_GUILD_FOR_CONFIG !== "false";
 const debugMessages = process.env.DEBUG_MESSAGES === "true";
 const ttsProvider = process.env.TTS_PROVIDER || "edge";
-const edgeTtsVoice = process.env.EDGE_TTS_VOICE || "es-PY-MarioNeural";
+const edgeTtsVoice = process.env.EDGE_TTS_VOICE || "es-AR-TomasNeural";
 const edgeTtsRate = process.env.EDGE_TTS_RATE || "+0%";
 const voiceSilenceMs = Number.parseInt(process.env.VOICE_SILENCE_MS || "450", 10);
 const voiceTriggerCooldownMs = Number.parseInt(process.env.VOICE_TRIGGER_COOLDOWN_MS || "3500", 10);
+const codexEnabled = process.env.CODEX_ENABLED !== "false";
+const codexWakeWord = normalizeText(process.env.CODEX_WAKE_WORD || "experiencia");
+const codexModel = process.env.CODEX_MODEL || "gpt-5.5";
+const codexReasoningEffort = process.env.CODEX_REASONING_EFFORT || "low";
+const codexTimeoutMs = Number.parseInt(process.env.CODEX_TIMEOUT_MS || "90000", 10);
+const codexMaxWords = Number.parseInt(process.env.CODEX_MAX_WORDS || "45", 10);
+const codexWakeCooldownMs = Number.parseInt(process.env.CODEX_WAKE_COOLDOWN_MS || "8000", 10);
 const lastResponseByChannel = new Map();
 const lastVoiceTriggerByGuild = new Map();
+const lastCodexWakeByGuild = new Map();
 const activeSpeechGuilds = new Set();
+const activeCodexGuilds = new Set();
 const speechQueues = new Map();
 const audioPlayers = new Map();
 const activeReceivers = new Set();
 const voskRequests = new Map();
+const botRootPath = fileURLToPath(new URL("..", import.meta.url));
 const dataFilePath = fileURLToPath(new URL("../data/triggers.json", import.meta.url));
 const debugLogPath = fileURLToPath(new URL("../data/debug.log", import.meta.url));
+const codexDirPath = fileURLToPath(new URL("../data/codex", import.meta.url));
 const ttsDirPath = fileURLToPath(new URL("../data/tts", import.meta.url));
 const ttsCacheDirPath = fileURLToPath(new URL("../data/tts-cache", import.meta.url));
 const voiceDirPath = fileURLToPath(new URL("../data/voice", import.meta.url));
@@ -101,6 +112,9 @@ client.once(Events.ClientReady, () => {
   console.log(`Prefijo de administracion: ${commandPrefix}`);
   console.log(`Keywords cargadas: ${triggerStore.triggers.length}`);
   console.log(`Voz: ${ttsProvider === "edge" ? edgeTtsVoice : "Windows SAPI"}`);
+  if (codexEnabled) {
+    console.log(`Wake Codex: ${codexWakeWord} -> ${codexModel}`);
+  }
   getVoskWorker();
   prewarmSpeechCache().catch((error) => console.error("No pude precachear audios:", error));
 });
@@ -430,6 +444,13 @@ function findMatchingTrigger(content) {
   });
 }
 
+function containsKeyword(content, keyword) {
+  const normalizedKeyword = normalizeText(keyword);
+  if (!normalizedKeyword) return false;
+
+  return ` ${normalizeText(content)} `.includes(` ${normalizedKeyword} `);
+}
+
 function pickRandomResponse(responses) {
   const bank = responses.length ? responses : fallbackWords;
   return bank[Math.floor(Math.random() * bank.length)];
@@ -625,6 +646,17 @@ async function handleSpokenSegment(connection, guildId, userId) {
     const transcript = await transcribeWav(wavFile);
     await debugLog(`voice transcript=${JSON.stringify(transcript)}`);
 
+    if (codexEnabled && containsKeyword(transcript, codexWakeWord)) {
+      const fullTranscript = await transcribeWav(wavFile, { grammar: false });
+      const question = extractCodexQuestion(transcript, fullTranscript);
+
+      await debugLog(
+        `codex wake transcript=${JSON.stringify(fullTranscript)} question=${JSON.stringify(question)}`,
+      );
+      await handleCodexVoiceQuestion(guildId, userId, question);
+      return;
+    }
+
     const trigger = findMatchingTrigger(transcript);
     if (!trigger) return;
     if (isVoiceTriggerOnCooldown(guildId, userId)) {
@@ -672,11 +704,21 @@ async function convertRawToWav(rawFile, wavFile) {
   );
 }
 
-async function transcribeWav(wavFile) {
-  const keywords = triggerStore.triggers.map((trigger) => trigger.keyword);
-  const stdout = await transcribeWithVoskWorker(wavFile, keywords);
+async function transcribeWav(wavFile, options = {}) {
+  const useGrammar = options.grammar !== false;
+  const keywords = useGrammar ? getVoiceKeywords() : [];
+  const stdout = await transcribeWithVoskWorker(wavFile, keywords, { grammar: useGrammar });
 
   return normalizeText(stdout);
+}
+
+function getVoiceKeywords() {
+  const keywords = triggerStore.triggers.map((trigger) => trigger.keyword);
+  if (codexEnabled && codexWakeWord) {
+    keywords.push(codexWakeWord);
+  }
+
+  return uniqueValues(keywords);
 }
 
 function getVoskWorker() {
@@ -740,18 +782,20 @@ function handleVoskWorkerLine(line) {
   request.resolve(payload.text || "");
 }
 
-function transcribeWithVoskWorker(wavFile, keywords) {
+function transcribeWithVoskWorker(wavFile, keywords, options = {}) {
   const worker = getVoskWorker();
   const id = voskRequestId++;
+  const useGrammar = options.grammar !== false;
+  const timeoutMs = useGrammar ? 6000 : 12000;
 
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       voskRequests.delete(id);
       reject(new Error("Vosk transcription timed out"));
-    }, 6000);
+    }, timeoutMs);
 
     voskRequests.set(id, { resolve, reject, timeout });
-    worker.stdin.write(`${JSON.stringify({ id, audio: wavFile, keywords })}\n`, (error) => {
+    worker.stdin.write(`${JSON.stringify({ id, audio: wavFile, keywords, grammar: useGrammar })}\n`, (error) => {
       if (!error) return;
 
       clearTimeout(timeout);
@@ -759,6 +803,209 @@ function transcribeWithVoskWorker(wavFile, keywords) {
       reject(error);
     });
   });
+}
+
+function extractQuestionAfterWake(transcript, wakeWord) {
+  const words = normalizeText(transcript).split(" ").filter(Boolean);
+  const wakeWords = normalizeText(wakeWord).split(" ").filter(Boolean);
+
+  if (!words.length || !wakeWords.length) return "";
+
+  for (let index = 0; index <= words.length - wakeWords.length; index += 1) {
+    const matches = wakeWords.every((word, offset) => words[index + offset] === word);
+    if (matches) {
+      return words.slice(index + wakeWords.length).join(" ");
+    }
+  }
+
+  return "";
+}
+
+function extractCodexQuestion(wakeTranscript, fullTranscript) {
+  const questionFromFullTranscript = extractQuestionAfterWake(fullTranscript, codexWakeWord);
+  if (questionFromFullTranscript) return questionFromFullTranscript;
+
+  if (fullTranscript && !containsKeyword(fullTranscript, codexWakeWord)) {
+    return normalizeText(fullTranscript);
+  }
+
+  return extractQuestionAfterWake(wakeTranscript, codexWakeWord);
+}
+
+async function handleCodexVoiceQuestion(guildId, userId, question) {
+  if (!question) {
+    markCodexWake(guildId);
+    markVoiceTrigger(guildId, userId);
+    await queueSpeech(guildId, `Decime la pregunta despues de ${codexWakeWord}.`);
+    return;
+  }
+
+  if (activeCodexGuilds.has(guildId)) {
+    await debugLog(`codex ignored busy question=${question}`);
+    return;
+  }
+
+  if (isCodexWakeOnCooldown(guildId)) {
+    await debugLog(`codex ignored cooldown question=${question}`);
+    return;
+  }
+
+  markCodexWake(guildId);
+  markVoiceTrigger(guildId, userId);
+  activeCodexGuilds.add(guildId);
+
+  try {
+    await debugLog(`codex question=${question}`);
+    const answer = await queryCodexCli(question);
+    const spokenAnswer = sanitizeCodexAnswer(answer);
+
+    await debugLog(`codex answer=${spokenAnswer}`);
+    await queueSpeech(guildId, spokenAnswer || "Codex no devolvio una respuesta.");
+  } catch (error) {
+    console.error("No pude consultar Codex CLI:", error.message);
+    await debugLog(`codex failed: ${error.message}`);
+    await queueSpeech(guildId, "No pude consultar Codex ahora.");
+  } finally {
+    activeCodexGuilds.delete(guildId);
+  }
+}
+
+function isCodexWakeOnCooldown(guildId) {
+  const lastAt = lastCodexWakeByGuild.get(guildId) || 0;
+  return Date.now() - lastAt < codexWakeCooldownMs;
+}
+
+function markCodexWake(guildId) {
+  lastCodexWakeByGuild.set(guildId, Date.now());
+}
+
+async function queryCodexCli(question) {
+  await mkdir(codexDirPath, { recursive: true });
+
+  const outputFile = join(codexDirPath, `${Date.now()}-${randomUUID()}.txt`);
+  const prompt = buildCodexPrompt(question);
+  const command = [
+    "codex",
+    "exec",
+    "-m",
+    quotePowerShellArg(codexModel),
+    "-c",
+    quotePowerShellArg(`model_reasoning_effort="${codexReasoningEffort}"`),
+    "--ephemeral",
+    "--skip-git-repo-check",
+    "--sandbox",
+    "read-only",
+    "--color",
+    "never",
+    "-C",
+    quotePowerShellArg(botRootPath),
+    "-o",
+    quotePowerShellArg(outputFile),
+    "-",
+  ].join(" ");
+
+  try {
+    await runCodexCommand(command, prompt, outputFile);
+    return await readFile(outputFile, "utf8");
+  } finally {
+    await unlink(outputFile).catch(() => {});
+  }
+}
+
+function runCodexCommand(command, prompt, outputFile) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      "powershell.exe",
+      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+      {
+        cwd: botRootPath,
+        windowsHide: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+
+    let settled = false;
+    let stderr = "";
+    let stdout = "";
+
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    };
+
+    const timeout = setTimeout(() => {
+      child.kill();
+      finish(new Error(`Codex CLI timed out after ${codexTimeoutMs}ms`));
+    }, codexTimeoutMs);
+
+    child.stdout.on("data", (chunk) => {
+      stdout = trimProcessBuffer(stdout + chunk.toString("utf8"));
+    });
+
+    child.stderr.on("data", (chunk) => {
+      stderr = trimProcessBuffer(stderr + chunk.toString("utf8"));
+    });
+
+    child.on("error", (error) => {
+      finish(error);
+    });
+
+    child.on("exit", async (code) => {
+      if (code !== 0) {
+        finish(new Error(`Codex CLI exited with code ${code}: ${stderr || stdout}`.trim()));
+        return;
+      }
+
+      if (!(await fileExists(outputFile))) {
+        finish(new Error(`Codex CLI did not write output: ${stderr || stdout}`.trim()));
+        return;
+      }
+
+      await debugLog(`codex cli stdout=${stdout.trim()} stderr=${stderr.trim()}`);
+      finish();
+    });
+
+    child.stdin.end(prompt, "utf8");
+  });
+}
+
+function buildCodexPrompt(question) {
+  return [
+    "Sos un asistente de voz dentro de un canal de Discord.",
+    `Responde en español claro. Maximo ${codexMaxWords} palabras.`,
+    "No uses markdown, listas, tablas, emojis ni bloques de codigo.",
+    "Si falta contexto, da la mejor respuesta breve y practica.",
+    `Pregunta del usuario: ${question}`,
+  ].join("\n");
+}
+
+function sanitizeCodexAnswer(answer) {
+  const cleaned = String(answer || "")
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/[`*_#>\[\]{}]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const words = cleaned.split(/\s+/).filter(Boolean);
+  if (words.length <= codexMaxWords) return cleaned;
+
+  return `${words.slice(0, codexMaxWords).join(" ")}.`;
+}
+
+function trimProcessBuffer(value) {
+  const maxLength = 4000;
+  return value.length <= maxLength ? value : value.slice(-maxLength);
+}
+
+function quotePowerShellArg(value) {
+  return `'${escapePowerShellString(value)}'`;
 }
 
 async function queueSpeech(guildId, text) {
