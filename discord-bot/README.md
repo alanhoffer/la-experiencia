@@ -68,7 +68,7 @@ CODEX_REASONING_EFFORT=low
 CODEX_TIMEOUT_MS=90000
 CODEX_MAX_WORDS=20
 CODEX_WAKE_COOLDOWN_MS=8000
-CODEX_HOLD_MUSIC=false
+CODEX_HOLD_MUSIC=true
 CODEX_HOLD_MUSIC_VOLUME=0.18
 ```
 
@@ -106,7 +106,7 @@ Las respuestas de voz se cachean en `data/tts-cache`, asi la primera vez puede t
 
 `CODEX_SKILL.md` es la skill local que se inyecta en cada consulta a Codex. Ahi podes registrar reglas fijas para la IA. El bot tambien le pasa contexto vivo del servidor, del usuario que pregunto y de los usuarios conectados al canal de voz donde esta el bot. Para listar todos los miembros del servidor completo hace falta activar el intent privilegiado `GuildMembers` en codigo y en Discord Developer Portal; para el canal de voz actual alcanza con `GuildVoiceStates`, que ya esta configurado.
 
-`CODEX_HOLD_MUSIC=false` deja apagada la musica de espera mientras Codex procesa la pregunta. Si la activas con `true`, `CODEX_HOLD_MUSIC_VOLUME` controla el volumen.
+`CODEX_HOLD_MUSIC=true` activa la musica de espera mientras Codex procesa la pregunta. `CODEX_HOLD_MUSIC_VOLUME` controla el volumen.
 
 ## Comandos
 
