@@ -1,0 +1,161 @@
+{
+  "triggers": [
+    {
+      "keyword": "viejo",
+      "responses": [
+        "peruano",
+        "toca nenes"
+      ]
+    },
+    {
+      "keyword": "mati",
+      "responses": [
+        "conocedor"
+      ]
+    },
+    {
+      "keyword": "a donde corremos",
+      "responses": [
+        "corremos b",
+        "corremos a"
+      ]
+    },
+    {
+      "keyword": "porro",
+      "responses": [
+        "todavía no",
+        "andá a hacer algo muy importante mati"
+      ]
+    },
+    {
+      "keyword": "peti",
+      "responses": [
+        "canuto",
+        "dopado"
+      ]
+    },
+    {
+      "keyword": "palenque",
+      "responses": [
+        "fijate si te habló tu señora"
+      ]
+    },
+    {
+      "keyword": "primo",
+      "responses": [
+        "¿Qué pasó negrazo?"
+      ]
+    },
+    {
+      "keyword": "donde plantaron",
+      "responses": [
+        "Plantaron en jota",
+        "Mirá el mapa pajín"
+      ]
+    },
+    {
+      "keyword": "gracias",
+      "responses": [
+        "jaja",
+        "re puto"
+      ]
+    }
+  ],
+  "aiTriggers": [
+    {
+      "keyword": "mamani",
+      "context": "Mamani es malisimo en todos los juegos. Bardo argentino corto, seco y directo, con insultos naturales. No empezar siempre con Mamani ni decir aparecio."
+    },
+    {
+      "keyword": "michi",
+      "context": "michi o el muñe es un pibe con un pito muy largo y negro y se come el penoche, seco y directo, con insultos naturales. No empezar siempre con el muñe ni decir aparecio."
+    },
+    {
+      "keyword": "lucas",
+      "context": "es gay y le gusta por la cola"
+    },
+    {
+      "keyword": "luquitas",
+      "context": "es gay y le gusta por la cola"
+    }
+  ],
+  "roastTargets": [],
+  "nicknames": [],
+  "lore": [],
+  "excuseCounts": [
+    {
+      "userId": "291813813324611584",
+      "displayName": "Palenque",
+      "count": 25,
+      "last": "lag",
+      "updatedAt": "2026-06-09T02:46:42.199Z"
+    },
+    {
+      "userId": "702728081408000041",
+      "displayName": "IvanCo",
+      "count": 20,
+      "last": "bug",
+      "updatedAt": "2026-06-09T02:51:00.487Z"
+    },
+    {
+      "userId": "300087446257795073",
+      "displayName": "Latas tiradas mal por Mamani: 54",
+      "count": 60,
+      "last": "lag",
+      "updatedAt": "2026-06-09T03:30:32.001Z"
+    },
+    {
+      "userId": "300096662683254787",
+      "displayName": "Cenarius",
+      "count": 3,
+      "last": "tecla",
+      "updatedAt": "2026-06-09T01:53:08.025Z"
+    },
+    {
+      "userId": "354419570561515521",
+      "displayName": "Le Fuen",
+      "count": 2,
+      "last": "tecla",
+      "updatedAt": "2026-06-09T01:50:24.546Z"
+    },
+    {
+      "userId": "300089923502080001",
+      "displayName": "El Muñe",
+      "count": 30,
+      "last": "lag",
+      "updatedAt": "2026-06-09T04:04:15.760Z"
+    },
+    {
+      "userId": "352280183182458880",
+      "displayName": "sugo96",
+      "count": 10,
+      "last": "bug",
+      "updatedAt": "2026-06-09T02:49:14.511Z"
+    },
+    {
+      "userId": "1450180442207686807",
+      "displayName": "Mati aranda",
+      "count": 20,
+      "last": "lag",
+      "updatedAt": "2026-06-09T04:13:48.562Z"
+    },
+    {
+      "userId": "264440957443768330",
+      "displayName": "Bee a keeper",
+      "count": 9,
+      "last": "lag",
+      "updatedAt": "2026-06-09T04:05:53.861Z"
+    },
+    {
+      "userId": "280054567075315714",
+      "displayName": "el pasti",
+      "count": 54,
+      "last": "tecla",
+      "updatedAt": "2026-06-09T04:14:22.531Z"
+    }
+  ],
+  "settings": {
+    "autoJoinMode": "most",
+    "characterMode": "normal"
+  }
+}

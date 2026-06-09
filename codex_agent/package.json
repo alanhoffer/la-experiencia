@@ -1,0 +1,14 @@
+{
+  "name": "viejo-codex-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Agente local persistente usando Codex SDK y la cuenta logueada del Codex CLI.",
+  "scripts": {
+    "ask": "node agent.mjs",
+    "reset-thread": "node reset-thread.mjs"
+  },
+  "dependencies": {
+    "@openai/codex-sdk": "^0.138.0"
+  }
+}

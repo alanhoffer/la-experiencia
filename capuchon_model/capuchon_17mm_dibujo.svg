@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="620" viewBox="0 0 820 620">
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#222" />
+    </marker>
+    <style>
+      .body { fill:#e7e5dc; stroke:#111; stroke-width:2; }
+      .cut { fill:#ffffff; stroke:#111; stroke-width:1.6; stroke-dasharray:5 4; }
+      .dim { stroke:#222; stroke-width:1.4; marker-start:url(#arrow); marker-end:url(#arrow); }
+      .guide { stroke:#777; stroke-width:1; stroke-dasharray:4 4; }
+      text { font-family: Arial, Helvetica, sans-serif; fill:#111; }
+      .note { fill:#4d4d4d; font-size:13px; }
+    </style>
+  </defs>
+  <rect width="100%" height="100%" fill="#fff"/>
+  <text x="28" y="34" font-size="22" font-weight="700">Capuchon - dibujo tecnico v1</text>
+  <text x="28" y="56" class="note">Unidades en milimetros. Receso ubicado a 3.7 mm desde la base y alto 3.8 mm.</text>
+
+  <polygon class="body" points="53.60,468.00 53.60,420.00 59.04,379.20 86.00,379.20 86.00,288.00 71.20,288.00 101.60,60.00 418.40,60.00 448.80,288.00 434.00,288.00 434.00,379.20 460.96,379.20 466.40,420.00 466.40,468.00" />
+  <path class="cut" d="M 128.00,468.00
+                       L 128.00,420.00
+                       L 146.00,420.00
+                       L 146.00,120.00
+                       L 374.00,120.00
+                       L 374.00,420.00
+                       L 392.00,420.00
+                       L 392.00,468.00
+                       Z" />
+  <line class="guide" x1="260.00" y1="488.00" x2="260.00" y2="40.00" />
+  <line class="guide" x1="466.40" y1="468.00" x2="680.00" y2="468.00" />
+  <line class="guide" x1="418.40" y1="60.00" x2="650.00" y2="60.00" />
+  <line class="dim" x1="650.00" y1="60.00" x2="650.00" y2="468.00" />
+  <text x="682.00" y="269.00" font-size="16" text-anchor="start">17 alto</text>
+
+  <line class="dim" x1="53.60" y1="502.00" x2="466.40" y2="502.00" />
+  <text x="260.00" y="526.00" font-size="16" text-anchor="middle">Ø17.2 base</text>
+
+  <line class="dim" x1="101.60" y1="34.00" x2="418.40" y2="34.00" />
+  <text x="260.00" y="22.00" font-size="16" text-anchor="middle">Ø13.2 arriba</text>
+
+  <line class="dim" x1="86.00" y1="333.60" x2="434.00" y2="333.60" />
+  <text x="260.00" y="324.60" font-size="14" text-anchor="middle">Ø14.5 receso</text>
+
+  <line class="dim" x1="96.00" y1="379.20" x2="96.00" y2="288.00" />
+  <text x="77.00" y="338.60" font-size="14" text-anchor="middle">3.8</text>
+  <line class="dim" x1="125.00" y1="468.00" x2="125.00" y2="379.20" />
+  <text x="107.00" y="428.60" font-size="14" text-anchor="middle">3.7</text>
+  <line class="dim" x1="72.00" y1="288.00" x2="72.00" y2="60.00" />
+  <text x="45.00" y="179.00" font-size="14" text-anchor="middle">9.5</text>
+
+  <line class="dim" x1="128.00" y1="444.00" x2="392.00" y2="444.00" />
+  <text x="260.00" y="430.00" font-size="14" text-anchor="middle">boca Ø11</text>
+  <line class="dim" x1="146.00" y1="398.00" x2="374.00" y2="398.00" />
+  <text x="260.00" y="388.00" font-size="14" text-anchor="middle">luego Ø9.5</text>
+  <line class="dim" x1="139.00" y1="468.00" x2="139.00" y2="420.00" />
+  <text x="121.00" y="449.00" font-size="14" text-anchor="middle">2</text>
+
+  <text x="560.00" y="126.00" font-size="15" text-anchor="start">Cono superior: 15 mm de alto</text>
+  <text x="560.00" y="150.00" font-size="15" text-anchor="start">Base recta asumida: 2 mm</text>
+  <text x="560.00" y="174.00" font-size="15" text-anchor="start">Boca inicial: Ø11 x 2 mm</text>
+  <text x="560.00" y="198.00" font-size="15" text-anchor="start">Hueco interior despues: Ø9.5</text>
+  <text x="560.00" y="222.00" font-size="15" text-anchor="start">Linea exterior: 3 mm ancho</text>
+  <text x="560.00" y="246.00" font-size="15" text-anchor="start">Sobresale: 0.45 mm</text>
+  <text x="560.00" y="274.00" font-size="13" text-anchor="start">Aristas rectas; no toca interior.</text>
+</svg>

@@ -1,7 +1,8 @@
 node_modules/
 .env
+**/.env
+**/.env.local
 *.log
 *.tmp
 *.wav
 *.mp3
-

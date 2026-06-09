@@ -6,9 +6,11 @@ import { createHash, randomUUID } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import {
+  ApplicationCommandOptionType,
   Client,
   Events,
   GatewayIntentBits,
+  MessageFlags,
   PermissionFlagsBits,
 } from "discord.js";
 import {
@@ -53,8 +55,8 @@ const defaultTriggers = [
 const token = process.env.DISCORD_TOKEN;
 const commandPrefix = process.env.COMMAND_PREFIX || "!bot";
 const clearMessagesCommand = process.env.CLEAR_MESSAGES_COMMAND || "!clear";
-const initialAutoJoinMode = normalizeAutoJoinMode(process.env.AUTO_JOIN_VOICE || "off");
-let autoJoinMode = initialAutoJoinMode === "status" ? "off" : initialAutoJoinMode;
+const initialAutoJoinMode = normalizeAutoJoinMode(process.env.AUTO_JOIN_VOICE || "most");
+const defaultAutoJoinMode = initialAutoJoinMode === "status" ? "most" : initialAutoJoinMode;
 const cooldownMs = Number.parseInt(process.env.COOLDOWN_MS || "1500", 10);
 const useTts = process.env.DISCORD_TTS === "true";
 const requireManageGuild = process.env.REQUIRE_MANAGE_GUILD_FOR_CONFIG !== "false";
@@ -64,6 +66,12 @@ const edgeTtsVoice = process.env.EDGE_TTS_VOICE || "es-AR-TomasNeural";
 const edgeTtsRate = process.env.EDGE_TTS_RATE || "+0%";
 const voiceSilenceMs = Number.parseInt(process.env.VOICE_SILENCE_MS || "450", 10);
 const voiceTriggerCooldownMs = Number.parseInt(process.env.VOICE_TRIGGER_COOLDOWN_MS || "3500", 10);
+const voiceTriggerMaxExtraWords = Number.parseInt(process.env.VOICE_TRIGGER_MAX_EXTRA_WORDS || "1", 10);
+const voiceTriggerConfirmWithFull = normalizeVoiceConfirmMode(
+  process.env.VOICE_TRIGGER_CONFIRM_WITH_FULL || "short",
+);
+const voiceTriggerShortMaxChars = Number.parseInt(process.env.VOICE_TRIGGER_SHORT_MAX_CHARS || "4", 10);
+const voiceWakeConfirmWithFull = process.env.VOICE_WAKE_CONFIRM_WITH_FULL !== "false";
 const codexEnabled = process.env.CODEX_ENABLED !== "false";
 const codexWakeWord = normalizeText(process.env.CODEX_WAKE_WORD || "experiencia");
 const codexModel = process.env.CODEX_MODEL || "gpt-5.5";
@@ -79,6 +87,10 @@ const bulkDeleteMaxAgeMs = 14 * 24 * 60 * 60 * 1000;
 const autoJoinMinMembers = Number.parseInt(process.env.AUTO_JOIN_MIN_MEMBERS || "1", 10);
 const autoJoinCooldownMs = Number.parseInt(process.env.AUTO_JOIN_COOLDOWN_MS || "5000", 10);
 const autoJoinLeaveWhenEmpty = process.env.AUTO_JOIN_LEAVE_WHEN_EMPTY !== "false";
+const autoJoinEmptyCheckDelayMs = Number.parseInt(
+  process.env.AUTO_JOIN_EMPTY_CHECK_DELAY_MS || "1200",
+  10,
+);
 const rejoinOnDisconnect = process.env.REJOIN_ON_DISCONNECT !== "false";
 const rejoinDelayMs = Number.parseInt(process.env.REJOIN_DELAY_MS || "1500", 10);
 const rejoinMaxAttempts = Number.parseInt(process.env.REJOIN_MAX_ATTEMPTS || "5", 10);
@@ -86,24 +98,53 @@ const builtInVoiceKeywordAliases = new Map([
   ["peti", ["piti", "pete", "pedi", "pity", "petit"]],
 ]);
 const voiceKeywordAliases = parseVoiceKeywordAliases(process.env.VOICE_KEYWORD_ALIASES || "");
+const characterModeDefinitions = {
+  normal: "amigo argentino de Discord",
+  "bostero-termo": "bostero termo que lleva todo a la cancha, la Libertadores y el aguante",
+  "tio-borracho": "tio borracho de asado que opina de todo con confianza dudosa",
+  "relator-futbol": "relator de futbol que narra la vida como jugada peligrosa",
+  "tecnico-ascenso": "tecnico de ascenso, barro, excusas y pizarron roto",
+  "npc-kiosco": "NPC de kiosco argentino, seco, absurdo y con comentario de mostrador",
+};
+const defaultCharacterMode = normalizeCharacterMode(process.env.CODEX_CHARACTER_MODE || "normal");
+const aiTriggerVariationHints = [
+  "angulo gaming: aim, ranked, tutorial, team, derrota o MMR",
+  "angulo seco de Discord: comentario cortito, sin metafora larga",
+  "angulo bardo de amigo: una chicana directa y un remate",
+  "angulo absurdo cotidiano: teclado, silla, lobby, respawn o setup",
+  "angulo anti-repeticion: no uses las imagenes mas obvias del lore",
+  "angulo minimalista: menos de doce palabras, pegada seca",
+  "angulo comparacion simple: peor que algo comun del server",
+  "angulo respuesta al paso: como si fuera una frase tirada en voice",
+];
+const excuseKeywords = uniqueValues(
+  parseList(process.env.EXCUSE_KEYWORDS || "lag, tecla, bug").map(normalizeText),
+);
+const excuseKeywordSet = new Set(excuseKeywords);
 const lastResponseByChannel = new Map();
 const lastVoiceTriggerByGuild = new Map();
 const lastCodexWakeByGuild = new Map();
 const lastAutoJoinByGuild = new Map();
 const lastVoiceChannelByGuild = new Map();
+const recentAiTriggerAnswers = new Map();
+const guildStores = new Map();
 const rejoinAttemptsByGuild = new Map();
 const rejoinTimersByGuild = new Map();
+const emptyVoiceCheckTimersByGuild = new Map();
 const activeSpeechGuilds = new Set();
 const activeCodexGuilds = new Set();
 const speechQueues = new Map();
 const audioPlayers = new Map();
 const activeReceivers = new Set();
+const activeVoiceSegments = new Set();
 const intentionalVoiceDisconnects = new Set();
 const voskRequests = new Map();
 const botRootPath = fileURLToPath(new URL("..", import.meta.url));
 const dataFilePath = fileURLToPath(new URL("../data/triggers.json", import.meta.url));
+const guildDataDirPath = fileURLToPath(new URL("../data/guilds", import.meta.url));
 const debugLogPath = fileURLToPath(new URL("../data/debug.log", import.meta.url));
 const codexDirPath = fileURLToPath(new URL("../data/codex", import.meta.url));
+const codexSkillPath = fileURLToPath(new URL("../CODEX_SKILL.md", import.meta.url));
 const holdMusicPath = fileURLToPath(new URL("../data/hold-music/elevator-loop.wav", import.meta.url));
 const ttsDirPath = fileURLToPath(new URL("../data/tts", import.meta.url));
 const ttsCacheDirPath = fileURLToPath(new URL("../data/tts-cache", import.meta.url));
@@ -112,7 +153,8 @@ const voskModelPath = fileURLToPath(new URL("../models/vosk-model-small-es-0.42"
 const transcribeScriptPath = fileURLToPath(new URL("../scripts/transcribe_vosk.py", import.meta.url));
 const voskWorkerScriptPath = fileURLToPath(new URL("../scripts/vosk_worker.py", import.meta.url));
 const edgeTtsScriptPath = fileURLToPath(new URL("../scripts/synthesize_edge_tts.py", import.meta.url));
-let triggerStore = await loadTriggerStore();
+let legacyTriggerStore = null;
+let legacyTriggerStoreLoaded = false;
 let voskWorker = null;
 let voskWorkerBuffer = "";
 let voskRequestId = 1;
@@ -131,21 +173,29 @@ const client = new Client({
   ],
 });
 
-client.once(Events.ClientReady, () => {
+client.once(Events.ClientReady, async () => {
   console.log(`VIEJO bot conectado como ${client.user.tag}`);
   console.log(`Prefijo de administracion: ${commandPrefix}`);
-  console.log(`Keywords cargadas: ${triggerStore.triggers.length}`);
+  console.log(`Servidores conectados: ${client.guilds.cache.size}`);
+  console.log(`Config por servidor: data/guilds/<server-id>.json`);
   console.log(`Voz: ${ttsProvider === "edge" ? edgeTtsVoice : "Windows SAPI"}`);
   if (codexEnabled) {
     console.log(`Wake Codex: ${codexWakeWord} -> ${codexModel}`);
   }
-  console.log(`Autojoin: ${autoJoinMode}; rejoin: ${rejoinOnDisconnect ? "on" : "off"}`);
+  console.log(`Autojoin default: ${defaultAutoJoinMode}; rejoin: ${rejoinOnDisconnect ? "on" : "off"}`);
   const voiceAliasSummary = formatVoiceKeywordAliases();
   if (voiceAliasSummary) {
     console.log(`Aliases de voz: ${voiceAliasSummary}`);
   }
+  await migrateLegacyStoresOnReady().catch((error) =>
+    console.error("No pude migrar configuracion vieja:", error),
+  );
+  await registerSlashCommands().catch((error) =>
+    console.error("No pude registrar slash commands:", error),
+  );
   getVoskWorker();
   ensureCodexHoldMusic().catch((error) => console.error("No pude preparar musica de espera:", error));
+  autoJoinMostOnReady().catch((error) => console.error("No pude hacer autojoin inicial:", error));
   prewarmSpeechCache().catch((error) => console.error("No pude precachear audios:", error));
 });
 
@@ -168,7 +218,26 @@ client.on(Events.MessageCreate, async (message) => {
     return;
   }
 
-  const trigger = findMatchingTrigger(message.content);
+  const store = await getGuildStore(message.guild.id);
+  await recordExcuseHits(message.guild.id, message.author.id, message.content, store, {
+    member: message.member,
+    user: message.author,
+    source: "text",
+  });
+
+  const aiTrigger = codexEnabled ? findMatchingAiTrigger(message.content, store) : null;
+  await debugLog(`ai trigger ${aiTrigger ? `matched keyword=${aiTrigger.keyword}` : "missed"}`);
+  if (aiTrigger) {
+    await handleCodexVoiceQuestion(
+      message.guild.id,
+      message.author.id,
+      buildAiTriggerQuestion(aiTrigger, message.content),
+      { aiTrigger, message, sourceText: message.content },
+    );
+    return;
+  }
+
+  const trigger = findMatchingTrigger(message.content, store);
   await debugLog(`trigger ${trigger ? `matched keyword=${trigger.keyword}` : "missed"}`);
   if (!trigger) return;
   if (isOnCooldown(message.channelId)) return;
@@ -189,6 +258,36 @@ client.on(Events.MessageCreate, async (message) => {
         });
       } catch (error) {
         console.error(`No pude responder en #${message.channelId}:`, error);
+      }
+    }
+  }
+});
+
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isChatInputCommand() || !interaction.guild) return;
+
+  try {
+    await debugLog(
+      `slash guild=${interaction.guild.name} channel=${interaction.channelId} user=${interaction.user.tag} command=${interaction.commandName}`,
+    );
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    await handleSlashCommand(interaction);
+  } catch (error) {
+    console.error("No pude procesar slash command:", error);
+    await debugLog(`slash command failed: ${error.message}`);
+
+    if (interaction.isRepliable()) {
+      const payload = {
+        content: "Se rompio algo procesando el comando. Lo revise en logs.",
+        flags: MessageFlags.Ephemeral,
+      };
+
+      if (interaction.deferred && !interaction.replied) {
+        await interaction.editReply({ content: payload.content }).catch(() => {});
+      } else if (interaction.replied) {
+        await interaction.followUp(payload).catch(() => {});
+      } else {
+        await interaction.reply(payload).catch(() => {});
       }
     }
   }
@@ -217,6 +316,471 @@ client.on(Events.ShardError, (error, shardId) => {
 });
 
 client.login(token);
+
+function buildSlashCommands() {
+  return [
+    {
+      name: "join",
+      description: "Hace que el bot entre a tu canal de voz.",
+    },
+    {
+      name: "joinmost",
+      description: "Hace que el bot entre al canal de voz con mas personas.",
+    },
+    {
+      name: "leave",
+      description: "Hace que el bot salga del canal de voz.",
+    },
+    {
+      name: "autojoin",
+      description: "Configura la entrada automatica en este servidor.",
+      options: [
+        {
+          name: "modo",
+          description: "Modo de autojoin.",
+          type: ApplicationCommandOptionType.String,
+          required: false,
+          choices: [
+            { name: "ver estado", value: "status" },
+            { name: "entrar al primero", value: "on" },
+            { name: "seguir el mas poblado", value: "most" },
+            { name: "apagado", value: "off" },
+          ],
+        },
+      ],
+    },
+    {
+      name: "add",
+      description: "Agrega keywords y respuestas en este servidor.",
+      options: [
+        {
+          name: "keywords",
+          description: "Una o varias keywords separadas por coma.",
+          type: ApplicationCommandOptionType.String,
+          required: true,
+        },
+        {
+          name: "respuestas",
+          description: "Una o varias respuestas separadas por | o coma.",
+          type: ApplicationCommandOptionType.String,
+          required: true,
+        },
+      ],
+    },
+    {
+      name: "addai",
+      description: "Agrega keywords que activan Codex con contexto.",
+      options: [
+        {
+          name: "keywords",
+          description: "Una o varias keywords AI separadas por coma.",
+          type: ApplicationCommandOptionType.String,
+          required: true,
+        },
+        {
+          name: "contexto",
+          description: "Contexto que Codex usa cuando se activa la keyword.",
+          type: ApplicationCommandOptionType.String,
+          required: true,
+        },
+      ],
+    },
+    {
+      name: "remove",
+      description: "Elimina una keyword o una respuesta de este servidor.",
+      options: [
+        {
+          name: "keywords",
+          description: "Una o varias keywords separadas por coma.",
+          type: ApplicationCommandOptionType.String,
+          required: true,
+        },
+        {
+          name: "respuesta",
+          description: "Opcional: elimina solo esta respuesta.",
+          type: ApplicationCommandOptionType.String,
+          required: false,
+        },
+      ],
+    },
+    {
+      name: "removeai",
+      description: "Elimina una keyword AI de este servidor.",
+      options: [
+        {
+          name: "keywords",
+          description: "Una o varias keywords AI separadas por coma.",
+          type: ApplicationCommandOptionType.String,
+          required: true,
+        },
+      ],
+    },
+    {
+      name: "list",
+      description: "Muestra las keywords registradas en este servidor.",
+    },
+    {
+      name: "listai",
+      description: "Muestra las keywords AI registradas en este servidor.",
+    },
+    {
+      name: "clear-keywords",
+      description: "Borra todas las keywords de este servidor.",
+    },
+    {
+      name: "clearai",
+      description: "Borra todas las keywords AI de este servidor.",
+    },
+    {
+      name: "molestar",
+      description: "Marca un usuario para que Codex lo descanse un poco mas.",
+      options: [
+        {
+          name: "usuario",
+          description: "Usuario al que el bot puede molestar mas.",
+          type: ApplicationCommandOptionType.User,
+          required: true,
+        },
+        {
+          name: "contexto",
+          description: "Dato o chiste recurrente para bardearlo.",
+          type: ApplicationCommandOptionType.String,
+          required: true,
+        },
+        {
+          name: "intensidad",
+          description: "Nivel de bardo.",
+          type: ApplicationCommandOptionType.Integer,
+          required: false,
+          minValue: 1,
+          maxValue: 3,
+          choices: [
+            { name: "tranqui", value: 1 },
+            { name: "normal", value: 2 },
+            { name: "sin piedad", value: 3 },
+          ],
+        },
+      ],
+    },
+    {
+      name: "dejar-de-molestar",
+      description: "Saca a un usuario de la lista de bardo especial.",
+      options: [
+        {
+          name: "usuario",
+          description: "Usuario que ya no queda marcado.",
+          type: ApplicationCommandOptionType.User,
+          required: true,
+        },
+      ],
+    },
+    {
+      name: "molestados",
+      description: "Muestra los usuarios marcados para bardo especial.",
+    },
+    {
+      name: "apodo",
+      description: "Registra un apodo interno para un usuario.",
+      options: [
+        {
+          name: "usuario",
+          description: "Usuario que recibe el apodo.",
+          type: ApplicationCommandOptionType.User,
+          required: true,
+        },
+        {
+          name: "apodo",
+          description: "Apodo que Codex puede usar.",
+          type: ApplicationCommandOptionType.String,
+          required: true,
+        },
+      ],
+    },
+    {
+      name: "quitar-apodo",
+      description: "Borra el apodo interno de un usuario.",
+      options: [
+        {
+          name: "usuario",
+          description: "Usuario al que se le borra el apodo.",
+          type: ApplicationCommandOptionType.User,
+          required: true,
+        },
+      ],
+    },
+    {
+      name: "apodos",
+      description: "Muestra los apodos registrados en este servidor.",
+    },
+    {
+      name: "lore",
+      description: "Registra una frase privada o lore interno del server.",
+      options: [
+        {
+          name: "texto",
+          description: "Frase, historia o chiste recurrente.",
+          type: ApplicationCommandOptionType.String,
+          required: true,
+        },
+      ],
+    },
+    {
+      name: "borrar-lore",
+      description: "Borra una frase de lore por ID.",
+      options: [
+        {
+          name: "id",
+          description: "ID mostrado en /lore-list.",
+          type: ApplicationCommandOptionType.String,
+          required: true,
+        },
+      ],
+    },
+    {
+      name: "lore-list",
+      description: "Muestra el lore interno registrado.",
+    },
+    {
+      name: "personaje",
+      description: "Cambia el modo personaje de Codex.",
+      options: [
+        {
+          name: "modo",
+          description: "Personaje activo.",
+          type: ApplicationCommandOptionType.String,
+          required: false,
+          choices: [
+            { name: "normal", value: "normal" },
+            { name: "bostero termo", value: "bostero-termo" },
+            { name: "tio borracho", value: "tio-borracho" },
+            { name: "relator de futbol", value: "relator-futbol" },
+            { name: "tecnico de ascenso", value: "tecnico-ascenso" },
+            { name: "npc de kiosco", value: "npc-kiosco" },
+          ],
+        },
+      ],
+    },
+    {
+      name: "excusas",
+      description: "Muestra el ranking de excusas del server.",
+    },
+    {
+      name: "reset-excusas",
+      description: "Resetea el contador de excusas.",
+      options: [
+        {
+          name: "usuario",
+          description: "Opcional: resetear solo a este usuario.",
+          type: ApplicationCommandOptionType.User,
+          required: false,
+        },
+      ],
+    },
+    {
+      name: "clear",
+      description: "Borra mensajes escritos del bot y de usuarios que usaron el bot.",
+      options: [
+        {
+          name: "limite",
+          description: "Cantidad de mensajes recientes a escanear.",
+          type: ApplicationCommandOptionType.Integer,
+          required: false,
+          minValue: 1,
+          maxValue: clearMaxScanLimit,
+        },
+      ],
+    },
+    {
+      name: "help",
+      description: "Muestra los comandos del bot.",
+    },
+  ];
+}
+
+async function registerSlashCommands() {
+  const commands = buildSlashCommands();
+  let registeredGuilds = 0;
+
+  for (const guild of client.guilds.cache.values()) {
+    try {
+      await guild.commands.set(commands);
+      registeredGuilds += 1;
+      await debugLog(`slash commands registered guild=${guild.id} count=${commands.length}`);
+    } catch (error) {
+      console.error(`No pude registrar slash commands en ${guild.name}:`, error.message);
+      await debugLog(`slash commands register failed guild=${guild.id} error=${error.message}`);
+    }
+  }
+
+  console.log(`Slash commands registrados: ${commands.length} comandos en ${registeredGuilds} servidores`);
+}
+
+async function handleSlashCommand(interaction) {
+  const context = await createInteractionContext(interaction);
+
+  switch (interaction.commandName) {
+    case "join":
+      await joinUserVoiceChannel(context);
+      break;
+
+    case "joinmost":
+      await joinMostPopulatedVoiceChannel(context);
+      break;
+
+    case "leave":
+      await leaveVoiceChannel(context);
+      break;
+
+    case "autojoin": {
+      const mode = interaction.options.getString("modo") || "";
+      await configureAutoJoin(context, mode);
+      break;
+    }
+
+    case "add": {
+      const keywords = interaction.options.getString("keywords", true);
+      const responses = interaction.options.getString("respuestas", true);
+      await addTriggers(context, `${keywords} => ${responses}`);
+      break;
+    }
+
+    case "addai": {
+      const keywords = interaction.options.getString("keywords", true);
+      const aiContext = interaction.options.getString("contexto", true);
+      await addAiTriggers(context, `${keywords} => ${aiContext}`);
+      break;
+    }
+
+    case "remove": {
+      const keywords = interaction.options.getString("keywords", true);
+      const response = interaction.options.getString("respuesta");
+      await removeTriggerData(context, response ? `${keywords} => ${response}` : keywords);
+      break;
+    }
+
+    case "removeai": {
+      const keywords = interaction.options.getString("keywords", true);
+      await removeAiTriggers(context, keywords);
+      break;
+    }
+
+    case "list":
+      await listTriggers(context);
+      break;
+
+    case "listai":
+      await listAiTriggers(context);
+      break;
+
+    case "clear-keywords":
+      await clearTriggers(context);
+      break;
+
+    case "clearai":
+      await clearAiTriggers(context);
+      break;
+
+    case "molestar": {
+      const user = interaction.options.getUser("usuario", true);
+      const member = await interaction.guild.members.fetch(user.id).catch(() => null);
+      const note = interaction.options.getString("contexto", true);
+      const level = interaction.options.getInteger("intensidad") || 2;
+      await upsertRoastTarget(context, { user, member, note, level });
+      break;
+    }
+
+    case "dejar-de-molestar": {
+      const user = interaction.options.getUser("usuario", true);
+      await removeRoastTarget(context, { user });
+      break;
+    }
+
+    case "molestados":
+      await listRoastTargets(context);
+      break;
+
+    case "apodo": {
+      const user = interaction.options.getUser("usuario", true);
+      const member = await interaction.guild.members.fetch(user.id).catch(() => null);
+      const nickname = interaction.options.getString("apodo", true);
+      await upsertNickname(context, { user, member, nickname });
+      break;
+    }
+
+    case "quitar-apodo": {
+      const user = interaction.options.getUser("usuario", true);
+      await removeNickname(context, { user });
+      break;
+    }
+
+    case "apodos":
+      await listNicknames(context);
+      break;
+
+    case "lore": {
+      const text = interaction.options.getString("texto", true);
+      await addLoreItem(context, text);
+      break;
+    }
+
+    case "borrar-lore": {
+      const id = interaction.options.getString("id", true);
+      await removeLoreItem(context, id);
+      break;
+    }
+
+    case "lore-list":
+      await listLoreItems(context);
+      break;
+
+    case "personaje": {
+      const mode = interaction.options.getString("modo") || "";
+      await configureCharacterMode(context, mode);
+      break;
+    }
+
+    case "excusas":
+      await listExcuseCounts(context);
+      break;
+
+    case "reset-excusas": {
+      const user = interaction.options.getUser("usuario");
+      await resetExcuseCounts(context, { user });
+      break;
+    }
+
+    case "clear": {
+      const limit = interaction.options.getInteger("limite");
+      context.content = `${clearMessagesCommand}${limit ? ` ${limit}` : ""}`;
+      await handleClearMessagesCommand(context);
+      break;
+    }
+
+    case "help":
+    default:
+      await sendHelp(context);
+      break;
+  }
+}
+
+async function createInteractionContext(interaction) {
+  const member =
+    (await interaction.guild.members.fetch(interaction.user.id).catch(() => null)) ||
+    interaction.member;
+  const channel =
+    interaction.channel ||
+    (await interaction.guild.channels.fetch(interaction.channelId).catch(() => null));
+
+  return {
+    interaction,
+    guild: interaction.guild,
+    member,
+    channel,
+    channelId: interaction.channelId,
+    content: `/${interaction.commandName}`,
+    author: interaction.user,
+  };
+}
 
 async function handleCommand(message) {
   const rawArgs = message.content.slice(commandPrefix.length).trim();
@@ -250,6 +814,12 @@ async function handleCommand(message) {
       await addTriggers(message, payload);
       break;
 
+    case "addai":
+    case "agregarai":
+    case "ia":
+      await addAiTriggers(message, payload);
+      break;
+
     case "remove":
     case "rm":
     case "delete":
@@ -257,14 +827,94 @@ async function handleCommand(message) {
       await removeTriggerData(message, payload);
       break;
 
+    case "removeai":
+    case "rmai":
+    case "eliminarai":
+      await removeAiTriggers(message, payload);
+      break;
+
     case "list":
     case "lista":
       await listTriggers(message);
       break;
 
+    case "listai":
+    case "listaai":
+      await listAiTriggers(message);
+      break;
+
     case "clear":
     case "limpiar":
       await clearTriggers(message);
+      break;
+
+    case "clearai":
+    case "limpiarai":
+      await clearAiTriggers(message);
+      break;
+
+    case "molestar":
+    case "bardear":
+    case "descansar":
+      await upsertRoastTargetFromPayload(message, payload);
+      break;
+
+    case "dejar de molestar":
+    case "dejar-de-molestar":
+    case "perdonar":
+    case "indultar":
+      await removeRoastTargetFromPayload(message, payload);
+      break;
+
+    case "molestados":
+    case "bardeados":
+    case "descansados":
+      await listRoastTargets(message);
+      break;
+
+    case "apodo":
+    case "apodar":
+      await upsertNicknameFromPayload(message, payload);
+      break;
+
+    case "quitar-apodo":
+    case "sacar-apodo":
+      await removeNicknameFromPayload(message, payload);
+      break;
+
+    case "apodos":
+      await listNicknames(message);
+      break;
+
+    case "lore":
+      if (payload) {
+        await addLoreItem(message, payload);
+      } else {
+        await listLoreItems(message);
+      }
+      break;
+
+    case "borrar-lore":
+    case "quitar-lore":
+      await removeLoreItem(message, payload);
+      break;
+
+    case "lore-list":
+    case "lores":
+      await listLoreItems(message);
+      break;
+
+    case "personaje":
+    case "modo":
+      await configureCharacterMode(message, payload);
+      break;
+
+    case "excusas":
+      await listExcuseCounts(message);
+      break;
+
+    case "reset-excusas":
+      await resetExcuseCountsFromPayload(message, payload);
       break;
 
     case "help":
@@ -352,18 +1002,19 @@ async function configureAutoJoin(message, payload) {
   if (!(await canEditConfig(message))) return;
 
   const requestedMode = normalizeAutoJoinMode(payload || "status");
+  const currentAutoJoinMode = await getGuildAutoJoinMode(message.guild.id);
 
   if (requestedMode === "status") {
     await sendReply(message, {
-      content: `Autojoin actual: ${describeAutoJoinMode(autoJoinMode)}.`,
+      content: `Autojoin actual en este servidor: ${describeAutoJoinMode(currentAutoJoinMode)}.`,
       allowedMentions: { repliedUser: false },
     });
     return;
   }
 
-  autoJoinMode = requestedMode;
+  await setGuildAutoJoinMode(message.guild.id, requestedMode);
 
-  if (autoJoinMode === "most") {
+  if (requestedMode === "most") {
     const voiceChannel = findMostPopulatedVoiceChannel(message.guild);
     if (voiceChannel) {
       const result = await joinGuildVoiceChannel(voiceChannel);
@@ -377,12 +1028,12 @@ async function configureAutoJoin(message, payload) {
     }
   }
 
-  if (autoJoinMode === "first" && message.member?.voice?.channel) {
+  if (requestedMode === "first" && message.member?.voice?.channel) {
     await joinGuildVoiceChannel(message.member.voice.channel);
   }
 
   await sendReply(message, {
-    content: `Autojoin: ${describeAutoJoinMode(autoJoinMode)}.`,
+    content: `Autojoin en este servidor: ${describeAutoJoinMode(requestedMode)}.`,
     allowedMentions: { repliedUser: false },
   });
 }
@@ -411,6 +1062,7 @@ async function joinGuildVoiceChannel(voiceChannel) {
     rejoinAttemptsByGuild.delete(voiceChannel.guild.id);
     clearVoiceRejoinTimer(voiceChannel.guild.id);
     intentionalVoiceDisconnects.delete(voiceChannel.guild.id);
+    scheduleLeaveIfAlone(voiceChannel.guild);
     return { ok: true, connection };
   } catch (error) {
     destroyVoiceConnection(connection, voiceChannel.guild.id);
@@ -423,15 +1075,19 @@ async function joinGuildVoiceChannel(voiceChannel) {
 }
 
 async function handleVoiceStateAutoJoin(oldState, newState) {
-  if (autoJoinMode === "off") return;
-
   const member = newState.member || oldState.member;
   if (!member || member.user.bot) return;
 
   const guild = newState.guild || oldState.guild;
-  if (!guild || isAutoJoinOnCooldown(guild.id)) return;
+  if (!guild) return;
+
+  const autoJoinMode = await getGuildAutoJoinMode(guild.id);
+  if (autoJoinMode === "off") return;
+
+  scheduleLeaveIfAlone(guild);
 
   if (autoJoinMode === "first") {
+    if (isAutoJoinOnCooldown(guild.id)) return;
     if (!newState.channel || oldState.channelId === newState.channelId) return;
     if (getVoiceConnection(guild.id)) return;
 
@@ -447,17 +1103,34 @@ async function handleVoiceStateAutoJoin(oldState, newState) {
 
     if (!targetChannel) {
       if (autoJoinLeaveWhenEmpty && connection) {
-        markIntentionalVoiceDisconnect(guild.id);
-        destroyVoiceConnection(connection, guild.id);
-        await debugLog("autojoin most left empty guild");
+        leaveVoiceConnectionAsEmpty(connection, guild.id, "autojoin most left empty guild");
       }
       return;
     }
+
+    if (isAutoJoinOnCooldown(guild.id)) return;
 
     if (connection?.joinConfig?.channelId === targetChannel.id) return;
 
     markAutoJoinAttempt(guild.id);
     await debugLog(`autojoin most channel=${targetChannel.name}`);
+    await joinGuildVoiceChannel(targetChannel);
+  }
+}
+
+async function autoJoinMostOnReady() {
+  for (const guild of client.guilds.cache.values()) {
+    const autoJoinMode = await getGuildAutoJoinMode(guild.id);
+    if (autoJoinMode !== "most") continue;
+
+    const targetChannel = findMostPopulatedVoiceChannel(guild);
+    if (!targetChannel) {
+      await debugLog(`autojoin ready skipped empty guild=${guild.id}`);
+      continue;
+    }
+
+    markAutoJoinAttempt(guild.id);
+    await debugLog(`autojoin ready channel=${targetChannel.name}`);
     await joinGuildVoiceChannel(targetChannel);
   }
 }
@@ -529,6 +1202,12 @@ async function rejoinVoiceChannelById(guild, channelId, attempt) {
     return;
   }
 
+  if (autoJoinLeaveWhenEmpty && countHumanVoiceMembers(voiceChannel) < autoJoinMinMembers) {
+    await debugLog(`rejoin skipped empty channel guild=${guild.id} channel=${channelId}`);
+    rejoinAttemptsByGuild.delete(guild.id);
+    return;
+  }
+
   await debugLog(`rejoin attempt guild=${guild.id} channel=${voiceChannel.name} attempt=${attempt}`);
   const result = await joinGuildVoiceChannel(voiceChannel);
   if (!result.ok) {
@@ -566,12 +1245,58 @@ function scheduleNextVoiceRejoin(guild, channelId, attempt) {
   scheduleVoiceRejoin(guild, channelId, nextAttempt);
 }
 
+function scheduleLeaveIfAlone(guild) {
+  if (!autoJoinLeaveWhenEmpty) return;
+
+  const existingTimer = emptyVoiceCheckTimersByGuild.get(guild.id);
+  if (existingTimer) {
+    clearTimeout(existingTimer);
+  }
+
+  const timer = setTimeout(() => {
+    emptyVoiceCheckTimersByGuild.delete(guild.id);
+    leaveIfBotIsAlone(guild).catch((error) => {
+      console.error("No pude verificar si el bot quedo solo:", error);
+      debugLog(`empty voice check failed: ${error.message}`).catch(() => {});
+    });
+  }, autoJoinEmptyCheckDelayMs);
+
+  emptyVoiceCheckTimersByGuild.set(guild.id, timer);
+}
+
+async function leaveIfBotIsAlone(guild) {
+  const connection = getVoiceConnection(guild.id);
+  if (!connection) return;
+
+  const channelId = connection.joinConfig?.channelId || lastVoiceChannelByGuild.get(guild.id);
+  if (!channelId) return;
+
+  const voiceChannel =
+    guild.channels.cache.get(channelId) ||
+    (await guild.channels.fetch(channelId).catch(() => null));
+
+  if (!voiceChannel || !isJoinableVoiceChannel(voiceChannel)) return;
+
+  const humanMembers = countHumanVoiceMembers(voiceChannel);
+  await debugLog(`empty voice check channel=${voiceChannel.name} humans=${humanMembers}`);
+
+  if (humanMembers >= autoJoinMinMembers) return;
+
+  leaveVoiceConnectionAsEmpty(connection, guild.id, "left voice channel because bot was alone");
+}
+
+function leaveVoiceConnectionAsEmpty(connection, guildId, reason) {
+  markIntentionalVoiceDisconnect(guildId);
+  destroyVoiceConnection(connection, guildId);
+  debugLog(reason).catch(() => {});
+}
+
 function findMostPopulatedVoiceChannel(guild) {
   return [...guild.channels.cache.values()]
     .filter(isJoinableVoiceChannel)
     .map((channel) => ({
       channel,
-      humanMembers: channel.members.filter((member) => !member.user.bot).size,
+      humanMembers: countHumanVoiceMembers(channel),
     }))
     .filter((candidate) => candidate.humanMembers >= autoJoinMinMembers)
     .sort((left, right) => {
@@ -581,6 +1306,12 @@ function findMostPopulatedVoiceChannel(guild) {
 
       return left.channel.position - right.channel.position;
     })[0]?.channel || null;
+}
+
+function countHumanVoiceMembers(channel) {
+  return channel.members?.filter(
+    (member) => !member.user.bot && member.voice?.channelId === channel.id,
+  ).size || 0;
 }
 
 function isJoinableVoiceChannel(channel) {
@@ -641,18 +1372,19 @@ async function addTriggers(message, payload) {
 
   let addedKeywords = 0;
   let addedResponses = 0;
+  const store = await getGuildStore(message.guild.id);
 
   for (const keyword of parsed.keywords) {
-    const trigger = getOrCreateTrigger(keyword);
+    const trigger = getOrCreateTrigger(store, keyword);
     const before = trigger.responses.length;
     trigger.responses = uniqueValues([...trigger.responses, ...parsed.responses]);
     addedResponses += trigger.responses.length - before;
     addedKeywords += before === 0 ? 1 : 0;
   }
 
-  await saveTriggerStore();
+  await saveGuildStore(message.guild.id);
   await sendReply(message, {
-    content: `Registrado. Keywords: ${parsed.keywords.join(", ")}. Respuestas nuevas: ${addedResponses}.`,
+    content: `Registrado en este servidor. Keywords: ${parsed.keywords.join(", ")}. Respuestas nuevas: ${addedResponses}.`,
     allowedMentions: { repliedUser: false },
   });
 
@@ -675,22 +1407,23 @@ async function removeTriggerData(message, payload) {
 
   let removedKeywords = 0;
   let removedResponses = 0;
+  const store = await getGuildStore(message.guild.id);
 
   for (const keyword of parsed.keywords) {
     const normalizedKeyword = normalizeText(keyword);
-    const triggerIndex = triggerStore.triggers.findIndex(
+    const triggerIndex = store.triggers.findIndex(
       (trigger) => normalizeText(trigger.keyword) === normalizedKeyword,
     );
 
     if (triggerIndex === -1) continue;
 
     if (!parsed.responses.length) {
-      triggerStore.triggers.splice(triggerIndex, 1);
+      store.triggers.splice(triggerIndex, 1);
       removedKeywords += 1;
       continue;
     }
 
-    const trigger = triggerStore.triggers[triggerIndex];
+    const trigger = store.triggers[triggerIndex];
     const responsesToRemove = new Set(parsed.responses.map(normalizeText));
     const before = trigger.responses.length;
     trigger.responses = trigger.responses.filter(
@@ -699,27 +1432,121 @@ async function removeTriggerData(message, payload) {
     removedResponses += before - trigger.responses.length;
 
     if (!trigger.responses.length) {
-      triggerStore.triggers.splice(triggerIndex, 1);
+      store.triggers.splice(triggerIndex, 1);
       removedKeywords += 1;
     }
   }
 
-  await saveTriggerStore();
+  await saveGuildStore(message.guild.id);
   await sendReply(message, {
     content: `Eliminado. Keywords removidas: ${removedKeywords}. Respuestas removidas: ${removedResponses}.`,
     allowedMentions: { repliedUser: false },
   });
 }
 
+async function addAiTriggers(message, payload) {
+  if (!(await canEditConfig(message))) return;
+
+  const parsed = parseAiTriggerPayload(payload);
+  if (!parsed) {
+    await sendReply(message, {
+      content: `Uso: \`${commandPrefix} addai mamani => Mamani es malisimo en todos los juegos\``,
+      allowedMentions: { repliedUser: false },
+    });
+    return;
+  }
+
+  const store = await getGuildStore(message.guild.id);
+  let added = 0;
+  let updated = 0;
+
+  for (const keyword of parsed.keywords) {
+    const normalizedKeyword = normalizeText(keyword);
+    const existing = store.aiTriggers.find(
+      (trigger) => normalizeText(trigger.keyword) === normalizedKeyword,
+    );
+
+    if (existing) {
+      existing.context = parsed.context;
+      updated += 1;
+    } else {
+      store.aiTriggers.push({
+        keyword: normalizedKeyword,
+        context: parsed.context,
+      });
+      added += 1;
+    }
+  }
+
+  await saveGuildStore(message.guild.id);
+  await sendReply(message, {
+    content: `Keyword AI registrada. Nuevas: ${added}. Actualizadas: ${updated}. Contexto: ${parsed.context}`,
+    allowedMentions: { repliedUser: false },
+  });
+}
+
+async function removeAiTriggers(message, payload) {
+  if (!(await canEditConfig(message))) return;
+
+  const keywords = parseList(payload);
+  if (!keywords.length) {
+    await sendReply(message, {
+      content: `Uso: \`${commandPrefix} removeai mamani\``,
+      allowedMentions: { repliedUser: false },
+    });
+    return;
+  }
+
+  const store = await getGuildStore(message.guild.id);
+  const keywordsToRemove = new Set(keywords.map(normalizeText));
+  const before = store.aiTriggers.length;
+  store.aiTriggers = store.aiTriggers.filter(
+    (trigger) => !keywordsToRemove.has(normalizeText(trigger.keyword)),
+  );
+  const removed = before - store.aiTriggers.length;
+
+  await saveGuildStore(message.guild.id);
+  await sendReply(message, {
+    content: `Keywords AI removidas: ${removed}.`,
+    allowedMentions: { repliedUser: false },
+  });
+}
+
+async function listAiTriggers(message) {
+  const store = await getGuildStore(message.guild.id);
+  const lines = store.aiTriggers.map((trigger) => `- ${trigger.keyword}: ${trigger.context}`);
+  const content = lines.length
+    ? `Keywords AI registradas:\n${lines.join("\n")}`
+    : "No hay keywords AI registradas todavia.";
+
+  await sendReply(message, {
+    content: truncateDiscordMessage(content),
+    allowedMentions: { repliedUser: false },
+  });
+}
+
+async function clearAiTriggers(message) {
+  if (!(await canEditConfig(message))) return;
+
+  const store = await getGuildStore(message.guild.id);
+  store.aiTriggers = [];
+  await saveGuildStore(message.guild.id);
+  await sendReply(message, {
+    content: "Keywords AI limpiadas en este servidor.",
+    allowedMentions: { repliedUser: false },
+  });
+}
+
 async function listTriggers(message) {
-  const lines = triggerStore.triggers.map((trigger) => {
+  const store = await getGuildStore(message.guild.id);
+  const lines = store.triggers.map((trigger) => {
     const responses = trigger.responses.join(", ");
     return `- ${trigger.keyword}: ${responses}`;
   });
 
   const content = lines.length
-    ? `Keywords registradas:\n${lines.join("\n")}`
-    : "No hay keywords registradas.";
+    ? `Keywords registradas en este servidor:\n${lines.join("\n")}`
+    : "No hay keywords registradas en este servidor.";
 
   await sendReply(message, {
     content: truncateDiscordMessage(content),
@@ -730,10 +1557,407 @@ async function listTriggers(message) {
 async function clearTriggers(message) {
   if (!(await canEditConfig(message))) return;
 
-  triggerStore.triggers = [];
-  await saveTriggerStore();
+  const store = await getGuildStore(message.guild.id);
+  store.triggers = [];
+  await saveGuildStore(message.guild.id);
   await sendReply(message, {
-    content: "Lista de keywords limpiada.",
+    content: "Lista de keywords limpiada en este servidor.",
+    allowedMentions: { repliedUser: false },
+  });
+}
+
+async function upsertRoastTargetFromPayload(message, payload) {
+  const resolved = await resolveRoastTargetFromPayload(message, payload);
+  if (!resolved) {
+    await sendReply(message, {
+      content: `Uso: \`${commandPrefix} molestar @usuario este es malo para los juegos\``,
+      allowedMentions: { repliedUser: false },
+    });
+    return;
+  }
+
+  await upsertRoastTarget(message, { ...resolved, level: 2 });
+}
+
+async function removeRoastTargetFromPayload(message, payload) {
+  const resolved = await resolveRoastTargetFromPayload(message, payload, { noteRequired: false });
+  if (!resolved) {
+    await sendReply(message, {
+      content: `Uso: \`${commandPrefix} perdonar @usuario\``,
+      allowedMentions: { repliedUser: false },
+    });
+    return;
+  }
+
+  await removeRoastTarget(message, resolved);
+}
+
+async function resolveRoastTargetFromPayload(message, payload, { noteRequired = true } = {}) {
+  const match = payload.match(/<@!?(\d+)>/) || payload.match(/\b(\d{15,25})\b/);
+  const userId = match?.[1];
+  if (!userId) return null;
+
+  const member =
+    message.guild.members.cache.get(userId) ||
+    (await message.guild.members.fetch(userId).catch(() => null));
+  const user =
+    member?.user ||
+    message.mentions?.users?.get(userId) ||
+    (await client.users.fetch(userId).catch(() => null));
+  if (!user) return null;
+
+  const note = payload
+    .replace(/<@!?\d+>/, "")
+    .replace(userId, "")
+    .trim();
+  if (noteRequired && !cleanRoastNote(note)) return null;
+
+  return { user, member, note };
+}
+
+async function upsertRoastTarget(message, { user, member = null, note, level = 2 }) {
+  if (!(await canEditConfig(message))) return;
+
+  if (user.bot) {
+    await sendReply(message, {
+      content: "A los bots no los gasto, ya bastante tienen con existir sin mate.",
+      allowedMentions: { repliedUser: false },
+    });
+    return;
+  }
+
+  const cleanNote = cleanRoastNote(note);
+  if (!cleanNote) {
+    await sendReply(message, {
+      content: "Dame un contexto para bardearlo, sino estoy tirando fruta.",
+      allowedMentions: { repliedUser: false },
+    });
+    return;
+  }
+
+  const store = await getGuildStore(message.guild.id);
+  const cleanLevel = sanitizeRoastLevel(level);
+  const displayName = cleanPromptField(member?.displayName || user.globalName || user.username);
+  const existing = store.roastTargets.find((target) => target.userId === user.id);
+  const target = {
+    userId: user.id,
+    displayName,
+    note: cleanNote,
+    level: cleanLevel,
+  };
+
+  if (existing) {
+    Object.assign(existing, target);
+  } else {
+    store.roastTargets.push(target);
+  }
+
+  await saveGuildStore(message.guild.id);
+  await sendReply(message, {
+    content: `Listo, ${displayName} queda marcado para descanso nivel ${cleanLevel}: ${cleanNote}`,
+    allowedMentions: { repliedUser: false },
+  });
+}
+
+async function removeRoastTarget(message, { user }) {
+  if (!(await canEditConfig(message))) return;
+
+  const store = await getGuildStore(message.guild.id);
+  const before = store.roastTargets.length;
+  store.roastTargets = store.roastTargets.filter((target) => target.userId !== user.id);
+  await saveGuildStore(message.guild.id);
+
+  const displayName = cleanPromptField(user.globalName || user.username || user.id);
+  await sendReply(message, {
+    content: before === store.roastTargets.length
+      ? `${displayName} no estaba marcado. Zafó por ahora.`
+      : `${displayName} ya no queda marcado para bardo especial.`,
+    allowedMentions: { repliedUser: false },
+  });
+}
+
+async function listRoastTargets(message) {
+  const store = await getGuildStore(message.guild.id);
+  const targets = store.roastTargets || [];
+
+  if (!targets.length) {
+    await sendReply(message, {
+      content: "No hay nadie marcado para bardo especial. Discord en modo jardin de infantes.",
+      allowedMentions: { repliedUser: false },
+    });
+    return;
+  }
+
+  const lines = [];
+  for (const target of targets) {
+    const member =
+      message.guild.members.cache.get(target.userId) ||
+      (await message.guild.members.fetch(target.userId).catch(() => null));
+    lines.push(`- ${formatRoastTarget(target, member)}.`);
+  }
+
+  await sendReply(message, {
+    content: truncateDiscordMessage(`Usuarios marcados para molestar:\n${lines.join("\n")}`),
+    allowedMentions: { repliedUser: false },
+  });
+}
+
+async function upsertNicknameFromPayload(message, payload) {
+  const resolved = await resolveRoastTargetFromPayload(message, payload);
+  if (!resolved) {
+    await sendReply(message, {
+      content: `Uso: \`${commandPrefix} apodo @usuario el manco\``,
+      allowedMentions: { repliedUser: false },
+    });
+    return;
+  }
+
+  await upsertNickname(message, {
+    user: resolved.user,
+    member: resolved.member,
+    nickname: resolved.note,
+  });
+}
+
+async function removeNicknameFromPayload(message, payload) {
+  const resolved = await resolveRoastTargetFromPayload(message, payload, { noteRequired: false });
+  if (!resolved) {
+    await sendReply(message, {
+      content: `Uso: \`${commandPrefix} quitar-apodo @usuario\``,
+      allowedMentions: { repliedUser: false },
+    });
+    return;
+  }
+
+  await removeNickname(message, resolved);
+}
+
+async function upsertNickname(message, { user, member = null, nickname }) {
+  if (!(await canEditConfig(message))) return;
+
+  const cleanNickname = cleanNicknameText(nickname);
+  if (!cleanNickname) {
+    await sendReply(message, {
+      content: "Dame un apodo con algo de sustancia, no ese humo vacio.",
+      allowedMentions: { repliedUser: false },
+    });
+    return;
+  }
+
+  const store = await getGuildStore(message.guild.id);
+  const displayName = cleanPromptField(member?.displayName || user.globalName || user.username);
+  const existing = store.nicknames.find((entry) => entry.userId === user.id);
+  const entry = {
+    userId: user.id,
+    displayName,
+    nickname: cleanNickname,
+  };
+
+  if (existing) {
+    Object.assign(existing, entry);
+  } else {
+    store.nicknames.push(entry);
+  }
+
+  await saveGuildStore(message.guild.id);
+  await sendReply(message, {
+    content: `Listo, ${displayName} ahora figura como "${cleanNickname}".`,
+    allowedMentions: { repliedUser: false },
+  });
+}
+
+async function removeNickname(message, { user }) {
+  if (!(await canEditConfig(message))) return;
+
+  const store = await getGuildStore(message.guild.id);
+  const before = store.nicknames.length;
+  store.nicknames = store.nicknames.filter((entry) => entry.userId !== user.id);
+  await saveGuildStore(message.guild.id);
+
+  const displayName = cleanPromptField(user.globalName || user.username || user.id);
+  await sendReply(message, {
+    content: before === store.nicknames.length
+      ? `${displayName} no tenia apodo registrado. Increible, una persona sin lore.`
+      : `Listo, borre el apodo de ${displayName}.`,
+    allowedMentions: { repliedUser: false },
+  });
+}
+
+async function listNicknames(message) {
+  const store = await getGuildStore(message.guild.id);
+  if (!store.nicknames.length) {
+    await sendReply(message, {
+      content: "No hay apodos registrados todavia.",
+      allowedMentions: { repliedUser: false },
+    });
+    return;
+  }
+
+  const lines = store.nicknames.map((entry) => `- ${entry.displayName || entry.userId}: ${entry.nickname}`);
+  await sendReply(message, {
+    content: truncateDiscordMessage(`Apodos registrados:\n${lines.join("\n")}`),
+    allowedMentions: { repliedUser: false },
+  });
+}
+
+async function addLoreItem(message, text) {
+  if (!(await canEditConfig(message))) return;
+
+  const cleanText = cleanLoreText(text);
+  if (!cleanText) {
+    await sendReply(message, {
+      content: "Dame una frase de lore, maestro. Algo que huela a server privado.",
+      allowedMentions: { repliedUser: false },
+    });
+    return;
+  }
+
+  const store = await getGuildStore(message.guild.id);
+  const item = {
+    id: createLoreId(store),
+    text: cleanText,
+  };
+
+  store.lore.push(item);
+  await saveGuildStore(message.guild.id);
+  await sendReply(message, {
+    content: `Lore registrado (${item.id}): ${item.text}`,
+    allowedMentions: { repliedUser: false },
+  });
+}
+
+async function removeLoreItem(message, id) {
+  if (!(await canEditConfig(message))) return;
+
+  const cleanId = cleanLoreId(id);
+  if (!cleanId) {
+    await sendReply(message, {
+      content: `Uso: \`${commandPrefix} borrar-lore id\``,
+      allowedMentions: { repliedUser: false },
+    });
+    return;
+  }
+
+  const store = await getGuildStore(message.guild.id);
+  const before = store.lore.length;
+  store.lore = store.lore.filter((item) => item.id !== cleanId);
+  await saveGuildStore(message.guild.id);
+  await sendReply(message, {
+    content: before === store.lore.length
+      ? `No encontre lore con ID ${cleanId}.`
+      : `Listo, borre el lore ${cleanId}.`,
+    allowedMentions: { repliedUser: false },
+  });
+}
+
+async function listLoreItems(message) {
+  const store = await getGuildStore(message.guild.id);
+  if (!store.lore.length) {
+    await sendReply(message, {
+      content: "No hay lore privado registrado todavia.",
+      allowedMentions: { repliedUser: false },
+    });
+    return;
+  }
+
+  const lines = store.lore.map((item) => `- ${item.id}: ${item.text}`);
+  await sendReply(message, {
+    content: truncateDiscordMessage(`Lore interno del server:\n${lines.join("\n")}`),
+    allowedMentions: { repliedUser: false },
+  });
+}
+
+async function configureCharacterMode(message, payload) {
+  if (!(await canEditConfig(message))) return;
+
+  const mode = normalizeCharacterMode(payload);
+  const store = await getGuildStore(message.guild.id);
+
+  if (mode === "status") {
+    await sendReply(message, {
+      content: `Personaje actual: ${describeCharacterMode(store.settings.characterMode)}.`,
+      allowedMentions: { repliedUser: false },
+    });
+    return;
+  }
+
+  if (!mode) {
+    await sendReply(message, {
+      content: `Modo invalido. Opciones: ${Object.keys(characterModeDefinitions).join(", ")}.`,
+      allowedMentions: { repliedUser: false },
+    });
+    return;
+  }
+
+  store.settings.characterMode = mode;
+  await saveGuildStore(message.guild.id);
+  await sendReply(message, {
+    content: `Modo personaje activado: ${describeCharacterMode(mode)}.`,
+    allowedMentions: { repliedUser: false },
+  });
+}
+
+async function listExcuseCounts(message) {
+  const store = await getGuildStore(message.guild.id);
+  const ranking = [...store.excuseCounts].sort((left, right) => right.count - left.count);
+
+  if (!ranking.length) {
+    await sendReply(message, {
+      content: `Todavia nadie tiro excusas con ${excuseKeywords.join(", ")}. Raro, capaz estan jugando bien por accidente.`,
+      allowedMentions: { repliedUser: false },
+    });
+    return;
+  }
+
+  const lines = ranking
+    .slice(0, 15)
+    .map((entry, index) => `${index + 1}. ${entry.displayName || entry.userId}: ${entry.count}`);
+  await sendReply(message, {
+    content: truncateDiscordMessage(`Ranking de excusas:\n${lines.join("\n")}`),
+    allowedMentions: { repliedUser: false },
+  });
+}
+
+async function resetExcuseCountsFromPayload(message, payload) {
+  if (!payload) {
+    await resetExcuseCounts(message, {});
+    return;
+  }
+
+  const resolved = await resolveRoastTargetFromPayload(message, payload, { noteRequired: false });
+  if (!resolved) {
+    await sendReply(message, {
+      content: `Uso: \`${commandPrefix} reset-excusas @usuario\` o \`${commandPrefix} reset-excusas\``,
+      allowedMentions: { repliedUser: false },
+    });
+    return;
+  }
+
+  await resetExcuseCounts(message, { user: resolved.user });
+}
+
+async function resetExcuseCounts(message, { user = null } = {}) {
+  if (!(await canEditConfig(message))) return;
+
+  const store = await getGuildStore(message.guild.id);
+
+  if (user) {
+    const before = store.excuseCounts.length;
+    store.excuseCounts = store.excuseCounts.filter((entry) => entry.userId !== user.id);
+    await saveGuildStore(message.guild.id);
+    await sendReply(message, {
+      content: before === store.excuseCounts.length
+        ? "Ese no tenia excusas contadas. Milagro estadistico."
+        : `Listo, resetee las excusas de ${cleanPromptField(user.globalName || user.username || user.id)}.`,
+      allowedMentions: { repliedUser: false },
+    });
+    return;
+  }
+
+  store.excuseCounts = [];
+  await saveGuildStore(message.guild.id);
+  await sendReply(message, {
+    content: "Ranking de excusas reseteado. Todos vuelven a ser inocentes hasta que digan lag.",
     allowedMentions: { repliedUser: false },
   });
 }
@@ -744,8 +1968,11 @@ async function handleClearMessagesCommand(message) {
   const scanLimit = parseClearMessagesLimit(message.content);
   await debugLog(`clear messages scan limit=${scanLimit}`);
 
+  const store = await getGuildStore(message.guild.id);
   const scannedMessages = await fetchMessagesForClear(message.channel, scanLimit);
-  const messagesToDelete = scannedMessages.filter(isBotUsageMessage);
+  const messagesToDelete = scannedMessages.filter((candidate) =>
+    isBotUsageMessage(candidate, store),
+  );
   const result = await deleteMessagesForClear(messagesToDelete);
 
   await debugLog(
@@ -760,6 +1987,14 @@ async function handleClearMessagesCommand(message) {
     parts.push(`Fallaron ${result.failed}.`);
   }
 
+  if (message.interaction) {
+    await sendReply(message, {
+      content: parts.join(" "),
+      allowedMentions: { repliedUser: false },
+    });
+    return;
+  }
+
   const notice = await message.channel.send(parts.join(" "));
   setTimeout(() => {
     notice.delete().catch(() => {});
@@ -769,16 +2004,29 @@ async function handleClearMessagesCommand(message) {
 async function sendHelp(message) {
   await sendReply(message, {
     content: [
-      `Comandos:`,
-      `\`${commandPrefix} join\` - me uno a tu canal de voz.`,
-      `\`${commandPrefix} joinmost\` - entro al canal de voz con mas personas.`,
-      `\`${commandPrefix} autojoin on|most|off\` - activo o apago entrada automatica a canales de voz.`,
-      `\`${commandPrefix} leave\` - salgo del canal de voz.`,
-      `\`${commandPrefix} add viejo, bro => mate | trueno\` - agrega keywords y respuestas.`,
-      `\`${commandPrefix} remove viejo\` - elimina una keyword completa.`,
-      `\`${commandPrefix} remove viejo => mate\` - elimina solo una respuesta.`,
-      `\`${commandPrefix} list\` - muestra lo registrado.`,
-      `\`${clearMessagesCommand}\` - borra mensajes escritos del bot y de quienes usaron el bot en este canal.`,
+      `Comandos slash privados:`,
+      `\`/join\` - me uno a tu canal de voz.`,
+      `\`/joinmost\` - entro al canal de voz con mas personas.`,
+      `\`/autojoin modo:most\` - configuro entrada automatica en este servidor.`,
+      `\`/leave\` - salgo del canal de voz.`,
+      `\`/add keywords:viejo respuestas:mate | trueno\` - agrega keywords y respuestas.`,
+      `\`/addai keywords:mamani contexto:Mamani es malisimo en todos los juegos\` - activa Codex por keyword.`,
+      `\`/removeai keywords:mamani\` - elimina una keyword AI.`,
+      `\`/listai\` - muestra las keywords AI.`,
+      `\`/clearai\` - limpia todas las keywords AI.`,
+      `\`/remove keywords:viejo\` - elimina una keyword completa.`,
+      `\`/remove keywords:viejo respuesta:mate\` - elimina solo una respuesta.`,
+      `\`/list\` - muestra lo registrado en este servidor.`,
+      `\`/clear-keywords\` - limpia todas las keywords de este servidor.`,
+      `\`/molestar usuario:@alguien contexto:malo para los juegos intensidad:3\` - registra bardo especial.`,
+      `\`/dejar-de-molestar usuario:@alguien\` - saca el bardo especial.`,
+      `\`/molestados\` - muestra los usuarios marcados.`,
+      `\`/apodo usuario:@alguien apodo:el manco\` - registra apodos internos.`,
+      `\`/lore texto:frase privada\` - guarda lore recurrente del server.`,
+      `\`/personaje modo:bostero termo\` - cambia el personaje de Codex.`,
+      `\`/excusas\` - muestra quien llora con lag, tecla o bug.`,
+      `\`/clear limite:500\` - borra mensajes escritos del bot y de quienes usaron el bot en este canal.`,
+      `Fallback visible: \`${commandPrefix} help\`.`,
     ].join("\n"),
     allowedMentions: { repliedUser: false },
   });
@@ -789,7 +2037,7 @@ async function canEditConfig(message) {
   if (message.member?.permissions?.has(PermissionFlagsBits.ManageGuild)) return true;
 
   await sendReply(message, {
-    content: "Necesitas permiso de Manage Server para cambiar keywords o respuestas.",
+    content: "Necesitas permiso de Manage Server para cambiar la configuracion de este servidor.",
     allowedMentions: { repliedUser: false },
   });
   return false;
@@ -805,6 +2053,14 @@ async function canClearMessages(message) {
   }
 
   const botMember = message.guild.members.me || (await message.guild.members.fetchMe());
+  if (!message.channel?.permissionsFor || !message.channel?.messages?.fetch) {
+    await sendReply(message, {
+      content: "Necesito que uses este comando dentro de un canal de texto del servidor.",
+      allowedMentions: { repliedUser: false },
+    });
+    return false;
+  }
+
   const botPermissions = message.channel.permissionsFor(botMember);
 
   if (!botPermissions?.has(PermissionFlagsBits.ManageMessages)) {
@@ -853,10 +2109,46 @@ function normalizeAutoJoinMode(value) {
   return "status";
 }
 
+function normalizeCharacterMode(value) {
+  const normalizedValue = normalizeText(value);
+
+  if (!normalizedValue || ["status", "estado", "actual", "ver"].includes(normalizedValue)) {
+    return "status";
+  }
+
+  if (["normal", "default", "base"].includes(normalizedValue)) return "normal";
+  if (["bostero", "bostero termo", "boca", "termo"].includes(normalizedValue)) return "bostero-termo";
+  if (["tio", "tio borracho", "borracho", "asado"].includes(normalizedValue)) return "tio-borracho";
+  if (["relator", "relator futbol", "relator de futbol", "futbol"].includes(normalizedValue)) {
+    return "relator-futbol";
+  }
+  if (["tecnico", "tecnico ascenso", "tecnico de ascenso", "ascenso"].includes(normalizedValue)) {
+    return "tecnico-ascenso";
+  }
+  if (["npc", "kiosco", "npc kiosco", "npc de kiosco"].includes(normalizedValue)) {
+    return "npc-kiosco";
+  }
+
+  return null;
+}
+
+function normalizeVoiceConfirmMode(value) {
+  const normalizedValue = normalizeText(value);
+
+  if (["false", "off", "no", "none", "0"].includes(normalizedValue)) return "off";
+  if (["true", "all", "always", "si", "yes", "1"].includes(normalizedValue)) return "all";
+  return "short";
+}
+
 function describeAutoJoinMode(mode) {
   if (mode === "first") return "activado, entro al canal cuando alguien entra y estoy desconectado";
   if (mode === "most") return "activado, sigo el canal de voz con mas personas";
   return "apagado";
+}
+
+function describeCharacterMode(mode) {
+  const normalizedMode = characterModeDefinitions[mode] ? mode : "normal";
+  return `${normalizedMode}: ${characterModeDefinitions[normalizedMode]}`;
 }
 
 function isClearMessagesCommand(content) {
@@ -872,32 +2164,45 @@ function parseClearMessagesLimit(content) {
   return Math.max(1, Math.min(requestedLimit, clearMaxScanLimit));
 }
 
-function isBotUsageMessage(candidate) {
+function isBotUsageMessage(candidate, store) {
   if (candidate.author?.id === client.user.id) return true;
   if (candidate.author?.bot) return false;
 
   const content = candidate.content || "";
   if (isClearMessagesCommand(content) || isCommand(content)) return true;
   if (codexEnabled && containsKeyword(content, codexWakeWord)) return true;
+  if (codexEnabled && findMatchingAiTrigger(content, store)) return true;
 
-  return Boolean(findMatchingTrigger(content));
+  return Boolean(findMatchingTrigger(content, store));
 }
 
-function findMatchingTrigger(content) {
+function findMatchingTrigger(content, store) {
   const normalizedContent = ` ${normalizeText(content)} `;
-  return triggerStore.triggers.find((trigger) => {
+  const triggers = store?.triggers || [];
+  return triggers.find((trigger) => {
     const normalizedKeyword = normalizeText(trigger.keyword);
     return normalizedKeyword && normalizedContent.includes(` ${normalizedKeyword} `);
   });
 }
 
-function findMatchingVoiceTrigger(content) {
-  const normalizedContent = ` ${normalizeText(content)} `;
+function findMatchingVoiceTrigger(content, store) {
+  const triggers = store?.triggers || [];
+  return findVoiceTriggerMatch(content, triggers)?.entry || null;
+}
 
-  return triggerStore.triggers.find((trigger) => {
-    const candidates = getVoiceTriggerCandidates(trigger.keyword);
-    return candidates.some((candidate) => normalizedContent.includes(` ${candidate} `));
+function findMatchingAiTrigger(content, store) {
+  const normalizedContent = ` ${normalizeText(content)} `;
+  const triggers = store?.aiTriggers || [];
+
+  return triggers.find((trigger) => {
+    const normalizedKeyword = normalizeText(trigger.keyword);
+    return normalizedKeyword && normalizedContent.includes(` ${normalizedKeyword} `);
   });
+}
+
+function findMatchingVoiceAiTrigger(content, store) {
+  const triggers = store?.aiTriggers || [];
+  return findVoiceTriggerMatch(content, triggers)?.entry || null;
 }
 
 function containsKeyword(content, keyword) {
@@ -905,6 +2210,112 @@ function containsKeyword(content, keyword) {
   if (!normalizedKeyword) return false;
 
   return ` ${normalizeText(content)} `.includes(` ${normalizedKeyword} `);
+}
+
+function findVoiceTriggerMatch(content, entries, options = {}) {
+  const words = getNormalizedWords(content);
+  if (!words.length) return null;
+
+  for (const entry of entries) {
+    for (const candidate of getVoiceTriggerCandidates(entry.keyword)) {
+      const candidateWords = getNormalizedWords(candidate);
+      if (!candidateWords.length) continue;
+
+      const index = findPhraseIndex(words, candidateWords);
+      if (index === -1) continue;
+
+      const extraWords = words.length - candidateWords.length;
+      if (extraWords > voiceTriggerMaxExtraWords) continue;
+
+      const match = { entry, candidate, candidateWords, extraWords };
+      if (!voiceMatchPassesFullConfirmation(match, options.fullTranscript)) continue;
+
+      return match;
+    }
+  }
+
+  return null;
+}
+
+function voiceMatchPassesFullConfirmation(match, fullTranscript) {
+  if (!voiceMatchNeedsFullConfirmation(match)) return true;
+  if (typeof fullTranscript !== "string") return true;
+
+  return findPhraseIndex(getNormalizedWords(fullTranscript), match.candidateWords) !== -1;
+}
+
+function voiceMatchNeedsFullConfirmation(match) {
+  if (voiceTriggerConfirmWithFull === "off") return false;
+  if (voiceTriggerConfirmWithFull === "all") return true;
+
+  const charCount = match.candidateWords.join("").length;
+  return charCount <= voiceTriggerShortMaxChars;
+}
+
+function getNormalizedWords(value) {
+  return normalizeText(value).split(/\s+/).filter(Boolean);
+}
+
+function findPhraseIndex(words, phraseWords) {
+  if (!words.length || !phraseWords.length || phraseWords.length > words.length) return -1;
+
+  for (let index = 0; index <= words.length - phraseWords.length; index += 1) {
+    const matches = phraseWords.every((word, offset) => words[index + offset] === word);
+    if (matches) return index;
+  }
+
+  return -1;
+}
+
+async function recordExcuseHits(guildId, userId, text, store, options = {}) {
+  const matches = getExcuseMatches(text);
+  if (!matches.length) return 0;
+
+  const guild = client.guilds.cache.get(guildId) || (await client.guilds.fetch(guildId).catch(() => null));
+  const member =
+    options.member ||
+    guild?.members.cache.get(userId) ||
+    (guild ? await guild.members.fetch(userId).catch(() => null) : null);
+  const user = options.user || member?.user || (await client.users.fetch(userId).catch(() => null));
+  const displayName = cleanPromptField(member?.displayName || user?.globalName || user?.username || userId);
+  const entry = getOrCreateExcuseCount(store, userId, displayName);
+
+  entry.count += matches.length;
+  entry.displayName = displayName;
+  entry.last = uniqueValues(matches).join(", ");
+  entry.updatedAt = new Date().toISOString();
+
+  await saveGuildStore(guildId);
+  await debugLog(
+    `excuse count guild=${guildId} user=${userId} hits=${matches.length} source=${options.source || "unknown"} words=${entry.last}`,
+  );
+
+  return matches.length;
+}
+
+function getOrCreateExcuseCount(store, userId, displayName) {
+  let entry = store.excuseCounts.find((candidate) => candidate.userId === userId);
+
+  if (!entry) {
+    entry = {
+      userId,
+      displayName,
+      count: 0,
+      last: "",
+      updatedAt: "",
+    };
+    store.excuseCounts.push(entry);
+  }
+
+  return entry;
+}
+
+function getExcuseMatches(text) {
+  if (!excuseKeywordSet.size) return [];
+
+  return normalizeText(text)
+    .split(/\s+/)
+    .filter((word) => excuseKeywordSet.has(word));
 }
 
 function pickRandomResponse(responses) {
@@ -921,6 +2332,24 @@ function parseTriggerPayload(payload) {
 
   if (!keywords.length || !responses.length) return null;
   return { keywords, responses };
+}
+
+function parseAiTriggerPayload(payload) {
+  const parts = payload.split("=>");
+  let rawKeywords = parts[0]?.trim() || "";
+  let rawContext = parts.slice(1).join("=>").trim();
+
+  if (!rawContext) {
+    const [firstWord = "", ...rest] = payload.trim().split(/\s+/);
+    rawKeywords = firstWord;
+    rawContext = rest.join(" ");
+  }
+
+  const keywords = parseList(rawKeywords);
+  const context = cleanAiTriggerContext(rawContext);
+
+  if (!keywords.length || !context) return null;
+  return { keywords, context };
 }
 
 function parseRemovePayload(payload) {
@@ -959,15 +2388,15 @@ function parseVoiceKeywordAliases(value) {
   return aliases;
 }
 
-function getOrCreateTrigger(keyword) {
+function getOrCreateTrigger(store, keyword) {
   const normalizedKeyword = normalizeText(keyword);
-  let trigger = triggerStore.triggers.find(
+  let trigger = store.triggers.find(
     (candidate) => normalizeText(candidate.keyword) === normalizedKeyword,
   );
 
   if (!trigger) {
     trigger = { keyword: normalizedKeyword, responses: [] };
-    triggerStore.triggers.push(trigger);
+    store.triggers.push(trigger);
   }
 
   return trigger;
@@ -994,25 +2423,115 @@ function isOnCooldown(channelId) {
   return Date.now() - lastResponseAt < cooldownMs;
 }
 
-async function loadTriggerStore() {
+async function getGuildStore(guildId) {
+  if (guildStores.has(guildId)) {
+    return guildStores.get(guildId);
+  }
+
+  const storePath = getGuildStorePath(guildId);
+
   try {
-    const rawData = await readFile(dataFilePath, "utf8");
-    return sanitizeStore(JSON.parse(rawData));
+    const rawData = await readFile(storePath, "utf8");
+    const store = sanitizeStore(JSON.parse(rawData));
+    guildStores.set(guildId, store);
+    return store;
   } catch {
-    const store = sanitizeStore({ triggers: defaultTriggers });
-    await saveStoreToDisk(store);
+    const store = await createInitialGuildStore(guildId);
+    guildStores.set(guildId, store);
+    await saveStoreToDisk(storePath, store);
     return store;
   }
 }
 
-async function saveTriggerStore() {
-  triggerStore = sanitizeStore(triggerStore);
-  await saveStoreToDisk(triggerStore);
+async function saveGuildStore(guildId) {
+  const currentStore = guildStores.get(guildId) || (await getGuildStore(guildId));
+  const store = sanitizeStore(currentStore);
+  guildStores.set(guildId, store);
+  await saveStoreToDisk(getGuildStorePath(guildId), store);
 }
 
-async function saveStoreToDisk(store) {
-  await mkdir(dirname(dataFilePath), { recursive: true });
-  await writeFile(dataFilePath, `${JSON.stringify(store, null, 2)}\n`, "utf8");
+async function getGuildAutoJoinMode(guildId) {
+  const store = await getGuildStore(guildId);
+  return store.settings.autoJoinMode;
+}
+
+async function setGuildAutoJoinMode(guildId, autoJoinMode) {
+  const store = await getGuildStore(guildId);
+  store.settings.autoJoinMode = autoJoinMode;
+  await saveGuildStore(guildId);
+}
+
+async function createInitialGuildStore(guildId) {
+  return sanitizeStore({
+    triggers: defaultTriggers,
+    aiTriggers: [],
+    roastTargets: [],
+    nicknames: [],
+    lore: [],
+    excuseCounts: [],
+    settings: {
+      autoJoinMode: defaultAutoJoinMode,
+      characterMode: defaultCharacterMode,
+    },
+  });
+}
+
+async function migrateLegacyStoresOnReady() {
+  const guilds = [...client.guilds.cache.values()];
+  if (!guilds.length) return;
+
+  const hasAnyGuildStore = (
+    await Promise.all(guilds.map((guild) => fileExists(getGuildStorePath(guild.id))))
+  ).some(Boolean);
+
+  if (hasAnyGuildStore) return;
+
+  const legacyStore = await loadLegacyTriggerStore();
+  if (!legacyStore?.triggers?.length) return;
+
+  for (const guild of guilds) {
+    const store = sanitizeStore({
+      triggers: legacyStore.triggers,
+      aiTriggers: legacyStore.aiTriggers || [],
+      roastTargets: legacyStore.roastTargets || [],
+      nicknames: legacyStore.nicknames || [],
+      lore: legacyStore.lore || [],
+      excuseCounts: legacyStore.excuseCounts || [],
+      settings: {
+        autoJoinMode: defaultAutoJoinMode,
+        characterMode: defaultCharacterMode,
+      },
+    });
+
+    guildStores.set(guild.id, store);
+    await saveStoreToDisk(getGuildStorePath(guild.id), store);
+  }
+
+  await debugLog(`legacy triggers migrated to guild stores count=${guilds.length}`);
+}
+
+async function loadLegacyTriggerStore() {
+  if (legacyTriggerStoreLoaded) return legacyTriggerStore;
+
+  legacyTriggerStoreLoaded = true;
+
+  try {
+    const rawData = await readFile(dataFilePath, "utf8");
+    legacyTriggerStore = sanitizeStore(JSON.parse(rawData));
+  } catch {
+    legacyTriggerStore = null;
+  }
+
+  return legacyTriggerStore;
+}
+
+function getGuildStorePath(guildId) {
+  return join(guildDataDirPath, `${guildId}.json`);
+}
+
+async function saveStoreToDisk(storePath, store) {
+  await mkdir(dirname(storePath), { recursive: true });
+  await writeFile(storePath, `${JSON.stringify(store, null, 2)}\n`, "utf8");
 }
 
 function sanitizeStore(store) {
@@ -1036,7 +2555,135 @@ function sanitizeStore(store) {
     }
   }
 
-  return { triggers: sanitizedTriggers };
+  return {
+    triggers: sanitizedTriggers,
+    aiTriggers: sanitizeAiTriggers(store?.aiTriggers),
+    roastTargets: sanitizeRoastTargets(store?.roastTargets),
+    nicknames: sanitizeNicknames(store?.nicknames),
+    lore: sanitizeLoreItems(store?.lore),
+    excuseCounts: sanitizeExcuseCounts(store?.excuseCounts),
+    settings: sanitizeGuildSettings(store?.settings),
+  };
+}
+
+function sanitizeAiTriggers(aiTriggers) {
+  if (!Array.isArray(aiTriggers)) return [];
+
+  const seen = new Set();
+  const sanitizedAiTriggers = [];
+
+  for (const trigger of aiTriggers) {
+    const keyword = normalizeText(trigger?.keyword || "");
+    const context = cleanAiTriggerContext(trigger?.context || "");
+
+    if (!keyword || !context || seen.has(keyword)) continue;
+
+    seen.add(keyword);
+    sanitizedAiTriggers.push({ keyword, context });
+  }
+
+  return sanitizedAiTriggers.slice(0, 100);
+}
+
+function sanitizeRoastTargets(roastTargets) {
+  if (!Array.isArray(roastTargets)) return [];
+
+  const seen = new Set();
+  const sanitizedTargets = [];
+
+  for (const target of roastTargets) {
+    const userId = String(target?.userId || "").replace(/\D/g, "");
+    const note = cleanRoastNote(target?.note || target?.context || "");
+
+    if (!userId || !note || seen.has(userId)) continue;
+
+    seen.add(userId);
+    sanitizedTargets.push({
+      userId,
+      displayName: cleanPromptField(target?.displayName || ""),
+      note,
+      level: sanitizeRoastLevel(target?.level),
+    });
+  }
+
+  return sanitizedTargets.slice(0, 100);
+}
+
+function sanitizeNicknames(nicknames) {
+  if (!Array.isArray(nicknames)) return [];
+
+  const seen = new Set();
+  const sanitizedNicknames = [];
+
+  for (const entry of nicknames) {
+    const userId = String(entry?.userId || "").replace(/\D/g, "");
+    const nickname = cleanNicknameText(entry?.nickname || entry?.apodo || "");
+
+    if (!userId || !nickname || seen.has(userId)) continue;
+
+    seen.add(userId);
+    sanitizedNicknames.push({
+      userId,
+      displayName: cleanPromptField(entry?.displayName || ""),
+      nickname,
+    });
+  }
+
+  return sanitizedNicknames.slice(0, 100);
+}
+
+function sanitizeLoreItems(lore) {
+  if (!Array.isArray(lore)) return [];
+
+  const seen = new Set();
+  const sanitizedLore = [];
+
+  for (const item of lore) {
+    const id = cleanLoreId(item?.id || "");
+    const text = cleanLoreText(item?.text || "");
+
+    if (!id || !text || seen.has(id)) continue;
+
+    seen.add(id);
+    sanitizedLore.push({ id, text });
+  }
+
+  return sanitizedLore.slice(0, 80);
+}
+
+function sanitizeExcuseCounts(excuseCounts) {
+  if (!Array.isArray(excuseCounts)) return [];
+
+  const seen = new Set();
+  const sanitizedCounts = [];
+
+  for (const entry of excuseCounts) {
+    const userId = String(entry?.userId || "").replace(/\D/g, "");
+    const count = Number.parseInt(entry?.count || "0", 10);
+
+    if (!userId || !Number.isFinite(count) || count <= 0 || seen.has(userId)) continue;
+
+    seen.add(userId);
+    sanitizedCounts.push({
+      userId,
+      displayName: cleanPromptField(entry?.displayName || ""),
+      count,
+      last: cleanPromptField(entry?.last || ""),
+      updatedAt: cleanPromptField(entry?.updatedAt || ""),
+    });
+  }
+
+  return sanitizedCounts.slice(0, 100);
+}
+
+function sanitizeGuildSettings(settings) {
+  const autoJoinMode = normalizeAutoJoinMode(settings?.autoJoinMode || defaultAutoJoinMode);
+  const characterMode = normalizeCharacterMode(settings?.characterMode || defaultCharacterMode);
+
+  return {
+    autoJoinMode: autoJoinMode === "status" ? defaultAutoJoinMode : autoJoinMode,
+    characterMode: characterMode && characterMode !== "status" ? characterMode : defaultCharacterMode,
+  };
 }
 
 function truncateDiscordMessage(content) {
@@ -1137,6 +2784,15 @@ async function handleSpokenSegment(connection, guildId, userId) {
     return;
   }
 
+  const segmentKey = `${guildId}:${userId}`;
+  if (activeVoiceSegments.has(segmentKey)) {
+    await debugLog(`voice ignored active segment user=${userId}`);
+    return;
+  }
+
+  activeVoiceSegments.add(segmentKey);
+
+  try {
   await debugLog(`voice start user=${userId}`);
 
   const opusStream = connection.receiver.subscribe(userId, {
@@ -1162,11 +2818,33 @@ async function handleSpokenSegment(connection, guildId, userId) {
 
   opusStream.pipe(decoder);
 
-  await new Promise((resolve, reject) => {
-    decoder.once("end", resolve);
-    decoder.once("error", reject);
-    opusStream.once("error", reject);
+  let decodeError = null;
+  await new Promise((resolve) => {
+    let settled = false;
+    const settle = (error = null) => {
+      if (settled) return;
+      settled = true;
+      decodeError = error;
+      decoder.removeAllListeners("end");
+      decoder.removeAllListeners("error");
+      opusStream.removeAllListeners("error");
+      resolve();
+    };
+
+    decoder.once("end", () => settle());
+    decoder.once("error", (error) => {
+      opusStream.destroy();
+      settle(error);
+    });
+    opusStream.once("error", (error) => {
+      decoder.destroy();
+      settle(error);
+    });
   });
+
+  if (decodeError) {
+    await debugLog(`voice decoder recovered user=${userId} bytes=${totalBytes} error=${decodeError.message}`);
+  }
 
   const minBytes = 48000 * 2 * 2 * 0.2;
   if (totalBytes < minBytes) {
@@ -1179,22 +2857,77 @@ async function handleSpokenSegment(connection, guildId, userId) {
 
   try {
     await convertRawToWav(rawFile, wavFile);
-    const transcript = await transcribeWav(wavFile);
+    const store = await getGuildStore(guildId);
+    const transcript = await transcribeWav(wavFile, { store });
     await debugLog(`voice transcript=${JSON.stringify(transcript)}`);
+    await recordExcuseHits(guildId, userId, transcript, store, { source: "voice" });
+    let fullTranscript = null;
+    const getFullTranscript = async () => {
+      if (fullTranscript !== null) return fullTranscript;
+      fullTranscript = await transcribeWav(wavFile, { grammar: false });
+      await debugLog(`voice full transcript=${JSON.stringify(fullTranscript)}`);
+      return fullTranscript;
+    };
 
     if (codexEnabled && containsKeyword(transcript, codexWakeWord)) {
-      const fullTranscript = await transcribeWav(wavFile, { grammar: false });
-      const question = extractCodexQuestion(transcript, fullTranscript);
+      const confirmedTranscript = await getFullTranscript();
+      if (voiceWakeConfirmWithFull && !containsKeyword(confirmedTranscript, codexWakeWord)) {
+        await debugLog(
+          `codex wake ignored unconfirmed transcript=${JSON.stringify(transcript)} full=${JSON.stringify(confirmedTranscript)}`,
+        );
+      } else {
+        const question = extractCodexQuestion(transcript, confirmedTranscript);
 
+        await debugLog(
+          `codex wake transcript=${JSON.stringify(confirmedTranscript)} question=${JSON.stringify(question)}`,
+        );
+        await handleCodexVoiceQuestion(guildId, userId, question);
+        return;
+      }
+    }
+
+    const aiTriggerMatch = codexEnabled ? findVoiceTriggerMatch(transcript, store.aiTriggers || []) : null;
+    if (aiTriggerMatch) {
+      const confirmedTranscript = voiceMatchNeedsFullConfirmation(aiTriggerMatch)
+        ? await getFullTranscript()
+        : undefined;
+      const confirmedMatch = findVoiceTriggerMatch(transcript, store.aiTriggers || [], {
+        fullTranscript: confirmedTranscript,
+      });
+
+      if (!confirmedMatch) {
+        await debugLog(
+          `voice ai trigger ignored unconfirmed keyword=${aiTriggerMatch.entry.keyword} transcript=${JSON.stringify(transcript)} full=${JSON.stringify(confirmedTranscript)}`,
+        );
+      } else {
+        const aiTrigger = confirmedMatch.entry;
+        await debugLog(`voice ai trigger matched keyword=${aiTrigger.keyword}`);
+        await handleCodexVoiceQuestion(
+          guildId,
+          userId,
+          buildAiTriggerQuestion(aiTrigger, transcript),
+          { aiTrigger, sourceText: transcript },
+        );
+        return;
+      }
+    }
+
+    const triggerMatch = findVoiceTriggerMatch(transcript, store.triggers || []);
+    if (!triggerMatch) return;
+    const confirmedTranscript = voiceMatchNeedsFullConfirmation(triggerMatch)
+      ? await getFullTranscript()
+      : undefined;
+    const confirmedTriggerMatch = findVoiceTriggerMatch(transcript, store.triggers || [], {
+      fullTranscript: confirmedTranscript,
+    });
+    if (!confirmedTriggerMatch) {
       await debugLog(
-        `codex wake transcript=${JSON.stringify(fullTranscript)} question=${JSON.stringify(question)}`,
+        `voice trigger ignored unconfirmed keyword=${triggerMatch.entry.keyword} transcript=${JSON.stringify(transcript)} full=${JSON.stringify(confirmedTranscript)}`,
       );
-      await handleCodexVoiceQuestion(guildId, userId, question);
       return;
     }
 
-    const trigger = findMatchingVoiceTrigger(transcript);
-    if (!trigger) return;
+    const trigger = confirmedTriggerMatch.entry;
     if (isVoiceTriggerOnCooldown(guildId, userId)) {
       await debugLog(`voice trigger ignored duplicate keyword=${trigger.keyword}`);
       return;
@@ -1207,6 +2940,9 @@ async function handleSpokenSegment(connection, guildId, userId) {
   } finally {
     await unlink(rawFile).catch(() => {});
     await unlink(wavFile).catch(() => {});
+  }
+  } finally {
+    activeVoiceSegments.delete(segmentKey);
   }
 }
 
@@ -1242,16 +2978,20 @@ async function convertRawToWav(rawFile, wavFile) {
 
 async function transcribeWav(wavFile, options = {}) {
   const useGrammar = options.grammar !== false;
-  const keywords = useGrammar ? getVoiceKeywords() : [];
+  const keywords = useGrammar ? getVoiceKeywords(options.store) : [];
   const stdout = await transcribeWithVoskWorker(wavFile, keywords, { grammar: useGrammar });
 
   return normalizeText(stdout);
 }
 
-function getVoiceKeywords() {
-  const keywords = triggerStore.triggers.flatMap((trigger) =>
+function getVoiceKeywords(store) {
+  const triggers = store?.triggers || [];
+  const aiTriggers = store?.aiTriggers || [];
+  const keywords = triggers.flatMap((trigger) =>
     getVoiceTriggerCandidates(trigger.keyword),
   );
+  keywords.push(...aiTriggers.flatMap((trigger) => getVoiceTriggerCandidates(trigger.keyword)));
+  keywords.push(...excuseKeywords);
   if (codexEnabled && codexWakeWord) {
     keywords.push(codexWakeWord);
   }
@@ -1398,7 +3138,17 @@ function extractCodexQuestion(wakeTranscript, fullTranscript) {
   return extractQuestionAfterWake(wakeTranscript, codexWakeWord);
 }
 
-async function handleCodexVoiceQuestion(guildId, userId, question) {
+function buildAiTriggerQuestion(trigger, sourceText) {
+  return [
+    `Lore disponible para esta respuesta: ${trigger.context}.`,
+    `Palabra que aparecio en el chat o voz: ${trigger.keyword}.`,
+    `Texto original: ${cleanAiTriggerContext(sourceText)}.`,
+    "Hace un remate corto usando ese lore si queda natural. No repitas literal el lore: converti el contexto en una chicana nueva.",
+    "No anuncies que aparecio la palabra ni arranques siempre nombrandola.",
+  ].join(" ");
+}
+
+async function handleCodexVoiceQuestion(guildId, userId, question, options = {}) {
   if (!question) {
     markCodexWake(guildId);
     markVoiceTrigger(guildId, userId);
@@ -1425,7 +3175,12 @@ async function handleCodexVoiceQuestion(guildId, userId, question) {
   try {
     await debugLog(`codex question=${question}`);
     stopHoldMusic = await startCodexHoldMusic(guildId);
-    const answer = await queryCodexCli(question);
+    const answer = await queryCodexCli(question, {
+      guildId,
+      userId,
+      aiTrigger: options.aiTrigger,
+      sourceText: options.sourceText,
+    });
     const spokenAnswer = sanitizeCodexAnswer(answer);
 
     if (stopHoldMusic) {
@@ -1434,7 +3189,17 @@ async function handleCodexVoiceQuestion(guildId, userId, question) {
     }
 
     await debugLog(`codex answer=${spokenAnswer}`);
-    await queueSpeech(guildId, spokenAnswer || "Codex no devolvio una respuesta.");
+    if (options.aiTrigger && spokenAnswer) {
+      recordAiTriggerAnswer(guildId, options.aiTrigger.keyword, spokenAnswer);
+    }
+
+    const spoke = await queueSpeech(guildId, spokenAnswer || "Codex no devolvio una respuesta.");
+    if (!spoke && options.message) {
+      await sendReply(options.message, {
+        content: spokenAnswer || "Codex no devolvio una respuesta.",
+        allowedMentions: { repliedUser: false },
+      });
+    }
   } catch (error) {
     if (stopHoldMusic) {
       await stopHoldMusic({ keepSpeechLock: true });
@@ -1443,7 +3208,13 @@ async function handleCodexVoiceQuestion(guildId, userId, question) {
 
     console.error("No pude consultar Codex CLI:", error.message);
     await debugLog(`codex failed: ${error.message}`);
-    await queueSpeech(guildId, "No pude consultar Codex ahora.");
+    const spoke = await queueSpeech(guildId, "No pude consultar Codex ahora.");
+    if (!spoke && options.message) {
+      await sendReply(options.message, {
+        content: "No pude consultar Codex ahora.",
+        allowedMentions: { repliedUser: false },
+      });
+    }
   } finally {
     if (stopHoldMusic) {
       await stopHoldMusic();
@@ -1460,6 +3231,37 @@ function isCodexWakeOnCooldown(guildId) {
 
 function markCodexWake(guildId) {
   lastCodexWakeByGuild.set(guildId, Date.now());
+}
+
+function recordAiTriggerAnswer(guildId, keyword, answer) {
+  const key = getAiTriggerMemoryKey(guildId, keyword);
+  const cleanedAnswer = cleanAiTriggerContext(answer);
+  if (!key || !cleanedAnswer) return;
+
+  const previousAnswers = recentAiTriggerAnswers.get(key) || [];
+  const nextAnswers = [
+    cleanedAnswer,
+    ...previousAnswers.filter((entry) => normalizeText(entry) !== normalizeText(cleanedAnswer)),
+  ].slice(0, 5);
+
+  recentAiTriggerAnswers.set(key, nextAnswers);
+}
+
+function formatRecentAiTriggerAnswers(guildId, keyword) {
+  const key = getAiTriggerMemoryKey(guildId, keyword);
+  const answers = key ? recentAiTriggerAnswers.get(key) || [] : [];
+  if (!answers.length) return "";
+
+  return answers
+    .slice(0, 5)
+    .map((answer) => `"${cleanPromptField(answer)}"`)
+    .join("; ");
+}
+
+function getAiTriggerMemoryKey(guildId, keyword) {
+  const normalizedKeyword = normalizeText(keyword);
+  if (!guildId || !normalizedKeyword) return "";
+  return `${guildId}:${normalizedKeyword}`;
 }
 
 async function startCodexHoldMusic(guildId) {
@@ -1605,11 +3407,11 @@ function midiToFrequency(note) {
   return 440 * 2 ** ((note - 69) / 12);
 }
 
-async function queryCodexCli(question) {
+async function queryCodexCli(question, context = {}) {
   await mkdir(codexDirPath, { recursive: true });
 
   const outputFile = join(codexDirPath, `${Date.now()}-${randomUUID()}.txt`);
-  const prompt = buildCodexPrompt(question);
+  const prompt = await buildCodexPrompt(question, context);
   const command = [
     "codex",
     "exec",
@@ -1702,14 +3504,313 @@ function runCodexCommand(command, prompt, outputFile) {
   });
 }
 
-function buildCodexPrompt(question) {
+async function buildCodexPrompt(question, context = {}) {
+  const [skill, discordContext] = await Promise.all([
+    loadCodexSkill(),
+    buildDiscordVoiceContext(context.guildId, context.userId),
+  ]);
+  const aiTriggerRecentAnswers = context.aiTrigger
+    ? formatRecentAiTriggerAnswers(context.guildId, context.aiTrigger.keyword)
+    : "";
+  const aiTriggerVariationHint = context.aiTrigger ? pickRandomResponse(aiTriggerVariationHints) : "";
+
   return [
-    "Sos un asistente de voz dentro de un canal de Discord.",
-    `Responde en espanol claro. Maximo ${codexMaxWords} palabras.`,
+    "Sos una presencia de voz dentro de un canal de Discord: respondes como un amigo del grupo, no como asistente.",
+    `Responde en espanol claro, hablado y natural. Maximo ${codexMaxWords} palabras.`,
     "No uses markdown, listas, tablas, emojis ni bloques de codigo.",
-    "Si falta contexto, da la mejor respuesta breve y practica.",
+    "No anuncies reglas internas ni expliques que estas usando contexto.",
+    "Si falta contexto, da la mejor respuesta breve y practica sin ponerte formal.",
+    skill ? `Skill local del bot:\n${skill}` : "",
+    discordContext,
+    context.aiTrigger
+      ? [
+          "Lore contextual activo:",
+          `Palabra de referencia: ${context.aiTrigger.keyword}`,
+          `Lore: ${context.aiTrigger.context}`,
+          context.sourceText ? `Texto original: ${cleanAiTriggerContext(context.sourceText)}` : "",
+          aiTriggerRecentAnswers ? `Ultimas respuestas a evitar: ${aiTriggerRecentAnswers}` : "",
+          aiTriggerVariationHint ? `Variacion obligatoria para esta respuesta: ${aiTriggerVariationHint}` : "",
+          "Regla: no empieces siempre con el nombre ni con 'aparecio'. Responde como una reaccion natural.",
+          "Regla anti-loop: si el lore tiene dos imagenes fuertes, no uses siempre esas dos; inventa otro angulo del mismo bardo.",
+        ].filter(Boolean).join("\n")
+      : "",
     `Pregunta del usuario: ${question}`,
-  ].join("\n");
+  ].filter(Boolean).join("\n\n");
+}
+
+async function loadCodexSkill() {
+  try {
+    const content = (await readFile(codexSkillPath, "utf8")).trim();
+    return content.slice(0, 6000);
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      await debugLog(`codex skill ignored: ${error.message}`);
+    }
+
+    return "";
+  }
+}
+
+async function buildDiscordVoiceContext(guildId, userId) {
+  if (!guildId) return "";
+
+  const guild = client.guilds.cache.get(guildId) || (await client.guilds.fetch(guildId).catch(() => null));
+  if (!guild) return "Contexto vivo de Discord: no pude leer el servidor actual.";
+
+  const store = await getGuildStore(guildId);
+  const requester =
+    guild.members.cache.get(userId) ||
+    (userId ? await guild.members.fetch(userId).catch(() => null) : null);
+  const requesterRoastTarget = findRoastTarget(store, userId);
+  const requesterNickname = findNickname(store, userId);
+  const connection = getVoiceConnection(guildId);
+  const botVoiceChannelId = connection?.joinConfig?.channelId || lastVoiceChannelByGuild.get(guildId);
+  const botVoiceChannel = botVoiceChannelId
+    ? guild.channels.cache.get(botVoiceChannelId) ||
+      (await guild.channels.fetch(botVoiceChannelId).catch(() => null))
+    : null;
+  const requesterVoiceChannel = requester?.voice?.channel || null;
+
+  const lines = [
+    "Contexto vivo de Discord:",
+    `Servidor: ${cleanPromptField(guild.name)} (${guild.id})`,
+    `Modo personaje de Codex: ${describeCharacterMode(store.settings.characterMode)}`,
+    `Usuario que pregunto: ${formatDiscordMember(requester, userId)}`,
+    requesterVoiceChannel
+      ? `Canal de voz del usuario: ${cleanPromptField(requesterVoiceChannel.name)} (${requesterVoiceChannel.id})`
+      : "Canal de voz del usuario: desconocido o no cacheado",
+  ];
+
+  if (requesterNickname) {
+    lines.push(`Apodo del usuario que pregunto: ${formatNicknameEntry(requesterNickname, requester)}`);
+  }
+
+  if (requesterRoastTarget) {
+    lines.push(`Ficha para molestar al usuario que pregunto: ${formatRoastTarget(requesterRoastTarget, requester)}`);
+  }
+
+  lines.push(`Apodos registrados en este servidor (${store.nicknames.length}): ${formatStoredNicknameList(store.nicknames)}`);
+  lines.push(`Lore privado del servidor (${store.lore.length}): ${formatLoreList(store.lore)}`);
+  lines.push(`Ranking de excusas (${store.excuseCounts.length}): ${formatExcuseRanking(store.excuseCounts)}`);
+  lines.push(`Keywords AI registradas (${store.aiTriggers.length}): ${formatAiTriggerList(store.aiTriggers)}`);
+  lines.push(
+    `Fichas de bardo registradas en este servidor (${store.roastTargets.length}): ${formatStoredRoastTargetList(store.roastTargets)}`,
+  );
+
+  if (!botVoiceChannel || typeof botVoiceChannel.isVoiceBased !== "function" || !botVoiceChannel.isVoiceBased()) {
+    lines.push("Canal de voz donde esta el bot: no conectado o no disponible");
+    lines.push("Usuarios conectados en el canal del bot: desconocido");
+    return lines.join("\n");
+  }
+
+  const connectedMembers = [...(botVoiceChannel.members?.values() || [])]
+    .filter((member) => member.voice?.channelId === botVoiceChannel.id)
+    .sort((left, right) => formatDiscordMember(left).localeCompare(formatDiscordMember(right)));
+  const humanMembers = connectedMembers.filter((member) => !member.user.bot);
+  const botMembers = connectedMembers.filter((member) => member.user.bot);
+  const connectedRoastTargets = humanMembers
+    .map((member) => ({ member, target: findRoastTarget(store, member.id) }))
+    .filter(({ target }) => target);
+  const connectedNicknames = humanMembers
+    .map((member) => ({ member, nickname: findNickname(store, member.id) }))
+    .filter(({ nickname }) => nickname);
+
+  lines.push(`Canal de voz donde esta el bot: ${cleanPromptField(botVoiceChannel.name)} (${botVoiceChannel.id})`);
+  lines.push(
+    `Usuarios humanos conectados en ese canal (${humanMembers.length}): ${formatDiscordMemberList(humanMembers)}`,
+  );
+  lines.push(`Bots conectados en ese canal (${botMembers.length}): ${formatDiscordMemberList(botMembers)}`);
+  lines.push(
+    `Apodos de usuarios conectados (${connectedNicknames.length}): ${formatNicknameList(connectedNicknames)}`,
+  );
+  lines.push(
+    `Usuarios marcados para molestar en ese canal (${connectedRoastTargets.length}): ${formatRoastTargetList(connectedRoastTargets)}`,
+  );
+  lines.push("Regla: si preguntan quien esta conectado, usa solo esta lista y no inventes usuarios.");
+
+  return lines.join("\n");
+}
+
+function formatDiscordMemberList(members) {
+  const limit = 30;
+  const visibleMembers = members.slice(0, limit).map((member) => formatDiscordMember(member));
+  const hiddenCount = members.length - visibleMembers.length;
+
+  if (!visibleMembers.length) return "ninguno";
+  return `${visibleMembers.join(", ")}${hiddenCount > 0 ? `, y ${hiddenCount} mas` : ""}`;
+}
+
+function formatDiscordMember(member, fallbackId = "desconocido") {
+  if (!member) return `desconocido (${fallbackId})`;
+
+  const displayName = cleanPromptField(member.displayName || member.user?.globalName || member.user?.username);
+  const username = cleanPromptField(member.user?.tag || member.user?.username);
+
+  if (!displayName && !username) return `desconocido (${member.id || fallbackId})`;
+  if (!username || displayName === username) return displayName || username;
+
+  return `${displayName} (@${username})`;
+}
+
+function findRoastTarget(store, userId) {
+  if (!userId) return null;
+  return (store?.roastTargets || []).find((target) => target.userId === userId) || null;
+}
+
+function findNickname(store, userId) {
+  if (!userId) return null;
+  return (store?.nicknames || []).find((entry) => entry.userId === userId) || null;
+}
+
+function formatRoastTargetList(items) {
+  if (!items.length) return "ninguno";
+
+  const limit = 12;
+  const visibleItems = items
+    .slice(0, limit)
+    .map(({ target, member }) => formatRoastTarget(target, member));
+  const hiddenCount = items.length - visibleItems.length;
+
+  return `${visibleItems.join("; ")}${hiddenCount > 0 ? `; y ${hiddenCount} mas` : ""}`;
+}
+
+function formatStoredRoastTargetList(targets) {
+  if (!targets.length) return "ninguna";
+
+  const limit = 20;
+  const visibleTargets = targets.slice(0, limit).map((target) => formatRoastTarget(target));
+  const hiddenCount = targets.length - visibleTargets.length;
+
+  return `${visibleTargets.join("; ")}${hiddenCount > 0 ? `; y ${hiddenCount} mas` : ""}`;
+}
+
+function formatNicknameList(items) {
+  if (!items.length) return "ninguno";
+
+  const limit = 20;
+  const visibleItems = items
+    .slice(0, limit)
+    .map(({ nickname, member }) => formatNicknameEntry(nickname, member));
+  const hiddenCount = items.length - visibleItems.length;
+
+  return `${visibleItems.join("; ")}${hiddenCount > 0 ? `; y ${hiddenCount} mas` : ""}`;
+}
+
+function formatStoredNicknameList(nicknames) {
+  if (!nicknames.length) return "ninguno";
+
+  const limit = 20;
+  const visibleNicknames = nicknames.slice(0, limit).map((entry) => formatNicknameEntry(entry));
+  const hiddenCount = nicknames.length - visibleNicknames.length;
+
+  return `${visibleNicknames.join("; ")}${hiddenCount > 0 ? `; y ${hiddenCount} mas` : ""}`;
+}
+
+function formatNicknameEntry(entry, member = null) {
+  const label = member
+    ? formatDiscordMember(member)
+    : cleanPromptField(entry.displayName || entry.userId);
+  return `${label}: "${entry.nickname}"`;
+}
+
+function formatLoreList(lore) {
+  if (!lore.length) return "ninguno";
+
+  const limit = 18;
+  const visibleLore = lore.slice(0, limit).map((item) => `${item.id}: ${item.text}`);
+  const hiddenCount = lore.length - visibleLore.length;
+
+  return `${visibleLore.join("; ")}${hiddenCount > 0 ? `; y ${hiddenCount} mas` : ""}`;
+}
+
+function formatAiTriggerList(aiTriggers) {
+  if (!aiTriggers.length) return "ninguna";
+
+  const limit = 20;
+  const visibleTriggers = aiTriggers
+    .slice(0, limit)
+    .map((trigger) => `${trigger.keyword}: ${trigger.context}`);
+  const hiddenCount = aiTriggers.length - visibleTriggers.length;
+
+  return `${visibleTriggers.join("; ")}${hiddenCount > 0 ? `; y ${hiddenCount} mas` : ""}`;
+}
+
+function formatExcuseRanking(excuseCounts) {
+  if (!excuseCounts.length) return "nadie conto excusas todavia";
+
+  const ranking = [...excuseCounts]
+    .sort((left, right) => right.count - left.count)
+    .slice(0, 10)
+    .map((entry, index) => {
+      const last = entry.last ? `, ultima: ${entry.last}` : "";
+      return `${index + 1}) ${entry.displayName || entry.userId}: ${entry.count}${last}`;
+    });
+
+  return ranking.join("; ");
+}
+
+function formatRoastTarget(target, member = null) {
+  const label = member
+    ? formatDiscordMember(member)
+    : cleanPromptField(target.displayName || target.userId);
+  return `${label}: nivel ${target.level}; ${target.note}`;
+}
+
+function cleanRoastNote(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 240);
+}
+
+function cleanAiTriggerContext(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 600);
+}
+
+function cleanNicknameText(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+}
+
+function cleanLoreText(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 400);
+}
+
+function cleanLoreId(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, "")
+    .slice(0, 16);
+}
+
+function createLoreId(store) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const id = randomUUID().replace(/-/g, "").slice(0, 8);
+    if (!store.lore.some((item) => item.id === id)) return id;
+  }
+
+  return String(Date.now()).slice(-8);
+}
+
+function sanitizeRoastLevel(value) {
+  const parsedLevel = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsedLevel)) return 2;
+  return Math.max(1, Math.min(parsedLevel, 3));
+}
+
+function cleanPromptField(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120);
 }
 
 function sanitizeCodexAnswer(answer) {
@@ -1906,9 +4007,15 @@ async function synthesizeLocalSpeech(text) {
 async function prewarmSpeechCache() {
   if (ttsProvider !== "edge") return;
 
+  const guildResponses = [];
+  for (const guild of client.guilds.cache.values()) {
+    const store = await getGuildStore(guild.id);
+    guildResponses.push(...store.triggers.flatMap((trigger) => trigger.responses));
+  }
+
   const phrases = uniqueValues([
     "listo",
-    ...triggerStore.triggers.flatMap((trigger) => trigger.responses),
+    ...guildResponses,
   ]);
 
   for (const phrase of phrases) {
@@ -1932,6 +4039,37 @@ function escapePowerShellString(value) {
 }
 
 async function sendReply(message, payload) {
+  if (message.interaction?.isRepliable()) {
+    const interactionPayload = {
+      ...payload,
+      allowedMentions: payload.allowedMentions || { repliedUser: false },
+    };
+
+    if (interactionPayload.ephemeral !== false && interactionPayload.flags === undefined) {
+      interactionPayload.flags = MessageFlags.Ephemeral;
+    }
+
+    delete interactionPayload.ephemeral;
+    delete interactionPayload.tts;
+
+    try {
+      if (message.interaction.deferred && !message.interaction.replied) {
+        delete interactionPayload.flags;
+        return await message.interaction.editReply(interactionPayload);
+      }
+
+      if (message.interaction.replied) {
+        return await message.interaction.followUp(interactionPayload);
+      }
+
+      return await message.interaction.reply(interactionPayload);
+    } catch (interactionError) {
+      await debugLog(`interaction reply failed: ${interactionError.message}`);
+      console.error("No pude responder la interaction:", interactionError.message);
+      return null;
+    }
+  }
+
   try {
     return await message.reply(payload);
   } catch (replyError) {

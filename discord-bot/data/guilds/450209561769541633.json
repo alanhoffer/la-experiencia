@@ -33,10 +33,13 @@
       ]
     }
   ],
-  "aiTriggers": [
-    {
-      "keyword": "mamani",
-      "context": "Mamani es malisimo en todos los juegos. Bardo argentino corto, seco y directo, con insultos naturales. No empezar siempre con Mamani ni decir aparecio."
-    }
-  ]
+  "aiTriggers": [],
+  "roastTargets": [],
+  "nicknames": [],
+  "lore": [],
+  "excuseCounts": [],
+  "settings": {
+    "autoJoinMode": "most",
+    "characterMode": "normal"
+  }
 }
